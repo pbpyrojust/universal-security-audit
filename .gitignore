@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Icon?
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Dependencies
+node_modules/
+
+# Output
+reports/
+dist/
+build/
+
+# Env
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
+
+# Temp/cache
+tmp/
+temp/
+.cache/
+# macOS / hidden system files
+# Windows system files
+# Logs / temp
+# Editors
+# macOS / Windows hidden files
+# Logs / temp / cache

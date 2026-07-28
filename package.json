@@ -1,0 +1,24 @@
+{
+  "name": "universal-security-audit",
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.8.0",
+  "description": "Technical security & attack-surface audit CLI: security header grading, CMS/hosting fingerprinting, exposed-path & admin/API discovery, third-party script + CVE lookups (OSV.dev/WPScan), PII & payment-processor detection, and a risk-graded HTML/PDF report.",
+  "scripts": {
+    "security-audit": "node scripts/run-security-audit.mjs",
+    "cli": "node bin/universal-security-audit.mjs"
+  },
+  "bin": {
+    "universal-security-audit": "bin/universal-security-audit.mjs",
+    "usaudit": "bin/universal-security-audit.mjs"
+  },
+  "dependencies": {
+    "chrome-launcher": "^1.1.2",
+    "csv-stringify": "^6.6.0",
+    "playwright": "^1.57.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
