@@ -23,5 +23,28 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "author": "Justin Adams (https://justwhat.net)",
+  "homepage": "https://github.com/pbpyrojust/universal-security-audit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pbpyrojust/universal-security-audit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pbpyrojust/universal-security-audit/issues"
+  },
+  "keywords": [
+    "security",
+    "pentest",
+    "attack-surface",
+    "vulnerability-scanner",
+    "security-headers",
+    "wordpress",
+    "cve",
+    "osv",
+    "wpscan",
+    "cli",
+    "audit",
+    "playwright"
+  ]
 }
