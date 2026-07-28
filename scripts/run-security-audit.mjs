@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 
 import { gradeSecurityHeaders, gradeCookies } from './lib/security-headers.mjs';
 import { detectPlatform, detectHosting, lookupDnsRecords, getTlsCertInfo, isWeakTlsProtocol } from './lib/fingerprint.mjs';
+import { checkResponseConsistency, checkReverseProxyIndicators, checkDnsLoadBalancingHint } from './lib/infra-topology.mjs';
 import { ADMIN_LOGIN_PATHS, EXPOSED_FILE_PATHS, EXPOSED_API_PATHS, probeAllPaths } from './lib/exposed-paths.mjs';
 import {
   extractInventoryFromHtml, identifyLibraries, extractWpPluginsAndThemes,
@@ -273,9 +274,17 @@ async function fetchXml(url) {
   return res.text();
 }
 function parseSitemapLocs(xml) { return [...xml.matchAll(/<loc>(.*?)<\/loc>/gsi)].map((m) => normalizeUrl(m[1].trim())).filter(Boolean); }
+function parseRobotsSitemapDirectives(robotsText = '') {
+  return [...robotsText.matchAll(/^sitemap:\s*(\S+)$/gim)].map((m) => m[1].trim());
+}
 async function discoverUrlsFromSitemap(site) {
   const base = new URL(site).origin;
-  const candidates = [`${base}/sitemap_index.xml`, `${base}/wp-sitemap.xml`, `${base}/sitemap.xml`];
+  let robotsDeclaredSitemaps = [];
+  try { robotsDeclaredSitemaps = parseRobotsSitemapDirectives(await fetchXml(new URL('/robots.txt', base).toString())); } catch {}
+  // robots.txt-declared sitemap URLs take priority — a site can put its sitemap anywhere it wants
+  // and robots.txt is the standard way to tell crawlers where; only fall back to guessing common
+  // paths (sitemap_index.xml/wp-sitemap.xml/sitemap.xml) if nothing is declared.
+  const candidates = [...new Set([...robotsDeclaredSitemaps, `${base}/sitemap_index.xml`, `${base}/wp-sitemap.xml`, `${base}/sitemap.xml`])];
   let xml = null, sitemapUrl = null;
   for (const cand of candidates) {
     try { xml = await fetchXml(cand); sitemapUrl = cand; break; } catch {}
@@ -290,7 +299,12 @@ async function discoverUrlsFromSitemap(site) {
   } else {
     urls = parseSitemapLocs(xml);
   }
-  return { sitemapUrl, urls: [...new Set(urls)].filter((u) => sameOrigin(u, site) && isCrawlablePage(u)) };
+  return {
+    sitemapUrl,
+    urls: [...new Set(urls)].filter((u) => sameOrigin(u, site) && isCrawlablePage(u)),
+    robotsDeclaredSitemaps,
+    sitemapDeclaredInRobots: !!sitemapUrl && robotsDeclaredSitemaps.includes(sitemapUrl),
+  };
 }
 async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
   const browser = await chromium.launch({ headless: true });
@@ -319,16 +333,18 @@ async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
 phaseHeader('Phase 1: URL discovery', '🗺️');
 const discStart = Date.now();
 let pageUrls = [site];
+let sitemapDiscovery = { sitemapUrl: null, robotsDeclaredSitemaps: [], sitemapDeclaredInRobots: false };
 if (args['crawl']) {
   pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl });
   statusMsg('🕷️', c.brightGreen, `Crawled ${pageUrls.length} page(s) via link-following.`);
 } else {
   try {
-    const { sitemapUrl, urls } = await discoverUrlsFromSitemap(site);
+    sitemapDiscovery = await discoverUrlsFromSitemap(site);
+    const { sitemapUrl, urls, sitemapDeclaredInRobots } = sitemapDiscovery;
     pageUrls = urls.length ? [...new Set([site, ...urls])].slice(0, maxPages) : [site];
-    statusMsg('🌐', c.brightGreen, `Found ${urls.length} URL(s) from ${sitemapUrl}; scanning ${pageUrls.length} page(s).`);
+    statusMsg('🌐', c.brightGreen, `Found ${urls.length} URL(s) from ${sitemapUrl}${sitemapDeclaredInRobots ? ' (declared in robots.txt)' : ' (not declared in robots.txt — found by guessing the path)'}; scanning ${pageUrls.length} page(s).`);
   } catch {
-    statusMsg('⚠', c.brightYellow, 'No sitemap found. Scanning homepage only — pass --crawl to discover more pages by following links.');
+    statusMsg('⚠', c.brightYellow, 'No sitemap found at any declared or common path. Scanning homepage only — pass --crawl to discover more pages by following links.');
   }
 }
 if (robotsCfg.isAllowedUrl) pageUrls = pageUrls.filter((u) => robotsCfg.isAllowedUrl(u));
@@ -374,6 +390,23 @@ try {
   statusMsg('🌐', c.dim, `DNS: ${dnsRecords.a.length} A record(s), ${dnsRecords.ns.length} NS, ${dnsRecords.mx.length} MX`);
 } catch {}
 
+const reverseProxyCheck = checkReverseProxyIndicators(homepageHeaders, hostingSignals);
+if (reverseProxyCheck.likelyProxied) {
+  statusMsg('🔀', c.dim, reverseProxyCheck.note);
+  addFinding({ category: 'infra-topology', severity: 'info', title: 'Site is served through a reverse proxy/CDN', detail: reverseProxyCheck.note, url: site });
+}
+const dnsLbHint = checkDnsLoadBalancingHint(dnsRecords, hostingSignals);
+if (dnsLbHint.likelyOwnLoadBalancing) {
+  statusMsg('🖥️', c.dim, `${dnsLbHint.aRecordCount} A records with no recognized CDN in front — possible DNS-level load balancing across your own servers.`);
+  addFinding({ category: 'infra-topology', severity: 'info', title: `${dnsLbHint.aRecordCount} DNS A records, no recognized CDN in front`, detail: 'Multiple IP addresses without a CDN suggests DNS round-robin load balancing across your own servers rather than a CDN edge network. Verify all backend servers are equally patched/configured — inconsistent servers behind a load balancer is a common source of hard-to-reproduce security gaps.', url: `dns:${hostname}` });
+}
+const responseConsistency = await checkResponseConsistency(site);
+if (responseConsistency.checked && responseConsistency.multiServerLikely) {
+  const variationSummary = responseConsistency.variations.map((v) => `${v.header}: ${v.values.join(' / ')}`).join('; ');
+  statusMsg('🖥️', c.brightYellow, `Repeated requests returned inconsistent headers — likely multiple backend servers: ${variationSummary}`);
+  addFinding({ category: 'infra-topology', severity: 'info', title: 'Inconsistent response headers across repeated requests', detail: `${variationSummary}. Different values for the same header on repeated requests to the same URL typically means multiple backend instances are answering behind a load balancer — make sure they're all running the same (patched) software version.`, url: site });
+}
+
 let tlsInfo = { ok: false };
 if (site.startsWith('https:')) {
   tlsInfo = await getTlsCertInfo(hostname);
@@ -405,10 +438,18 @@ if (corsResult.checked && corsResult.misconfigured) {
   addFinding({ category: 'cors', severity: 'low', title: 'CORS reflects/wildcards Origin', detail: corsResult.note, url: site });
 }
 
-const crawlerExposure = await summarizeCrawlerExposure(origin);
-statusMsg('🤖', c.dim, `robots.txt: ${crawlerExposure.hasRobots ? 'present' : 'absent'} · llms.txt: ${crawlerExposure.hasLlmsTxt ? 'present' : 'absent'} · sitemap: ${crawlerExposure.hasSitemap ? 'present' : 'absent'}`);
+const crawlerExposure = await summarizeCrawlerExposure(origin, sitemapDiscovery);
+statusMsg('🤖', c.dim, `robots.txt: ${crawlerExposure.hasRobots ? 'present' : 'absent'} · llms.txt: ${crawlerExposure.hasLlmsTxt ? 'present' : 'absent'} · sitemap: ${crawlerExposure.hasSitemap ? 'present' : crawlerExposure.hasSitemap === false ? 'absent' : 'not checked'}`);
 if (crawlerExposure.sensitiveLookingDisallows.length) {
   addFinding({ category: 'crawler-exposure', severity: 'info', title: 'robots.txt names sensitive-looking paths', detail: `${crawlerExposure.note} Paths: ${crawlerExposure.sensitiveLookingDisallows.join(', ')}`, url: new URL('/robots.txt', origin).toString() });
+}
+if (crawlerExposure.sitemapUndeclaredButReachable) {
+  statusMsg('🗺️', c.dim, `Sitemap found at ${crawlerExposure.sitemapUrl} but robots.txt declares a different one.`);
+  addFinding({ category: 'crawler-exposure', severity: 'info', title: 'A working sitemap was found, but robots.txt declares a different sitemap URL', detail: `Found and used: ${crawlerExposure.sitemapUrl}. robots.txt declares: ${crawlerExposure.robotsDeclaredSitemaps.join(', ')}. Search engines that only read robots.txt for sitemap discovery may miss the one actually in use, or vice versa.`, url: new URL('/robots.txt', origin).toString() });
+}
+if (crawlerExposure.sitemapDeclaredButUnreachable) {
+  statusMsg('⚠', c.brightYellow, `robots.txt declares a sitemap that could not be fetched: ${crawlerExposure.robotsDeclaredSitemaps.join(', ')}`);
+  addFinding({ category: 'crawler-exposure', severity: 'low', title: 'robots.txt declares a sitemap URL that is not reachable', detail: `Declared: ${crawlerExposure.robotsDeclaredSitemaps.join(', ')}. This returns an error or isn't valid XML — crawlers following robots.txt will fail to discover pages via this sitemap.`, url: new URL('/robots.txt', origin).toString() });
 }
 phaseDone('Site-wide checks', Date.now() - siteWideStart);
 
@@ -535,21 +576,24 @@ let allStyleUrls = [];
 let siteGenerator = '';
 let siteHtmlSample = '';
 const pageResults = [];
+const pageHeaderSets = [];
 for (let i = 0; i < pageUrls.length; i++) {
   const url = pageUrls[i];
   const page = await context.newPage();
   try {
-    await page.goto(url, { waitUntil: slowMode ? 'domcontentloaded' : 'networkidle', timeout: 45000 });
+    const response = await page.goto(url, { waitUntil: slowMode ? 'domcontentloaded' : 'networkidle', timeout: 45000 });
     await page.waitForTimeout(slowMode ? 1500 : 500);
     const html = await page.content();
     const cookies = await context.cookies();
+    const pageHeaders = response ? response.headers() : {};
     const inv = extractInventoryFromHtml(html, url);
     allScriptUrls.push(...inv.scriptUrls);
     allStyleUrls.push(...inv.styleUrls);
     if (!siteGenerator && inv.generator) siteGenerator = inv.generator;
     if (i === 0) siteHtmlSample = html;
 
-    const platformSignals = detectPlatform({ html, headers: homepageHeaders, scriptSrcs: inv.scriptUrls, cookieNames: cookies.map((ck) => ck.name) });
+    const platformSignals = detectPlatform({ html, headers: pageHeaders, scriptSrcs: inv.scriptUrls, cookieNames: cookies.map((ck) => ck.name) });
+    pageHeaderSets.push({ url, server: pageHeaders['server'] || '', poweredBy: pageHeaders['x-powered-by'] || '', via: pageHeaders['via'] || '' });
     const pii = scanForPii(html);
     const payments = detectPaymentProcessors(html, inv.scriptUrls);
     const mixed = findMixedContent(html, url);
@@ -584,6 +628,42 @@ const invStart = Date.now();
 const platformSignals = detectPlatform({ html: siteHtmlSample, headers: homepageHeaders, scriptSrcs: allScriptUrls, cookieNames: [] });
 const primaryPlatform = platformSignals[0]?.platform || 'Unknown/Custom';
 statusMsg('🧩', c.brightCyan, `Detected platform: ${c.bold}${primaryPlatform}${c.reset} (${platformSignals[0]?.confidence || 'low'} confidence)`);
+
+// Cross-reference platform signals across every scanned page (not just the homepage) — a
+// different high-confidence platform showing up on a different page/subsection is a real signal
+// of a hybrid architecture (e.g. a WordPress marketing site with a separate Rails donation app).
+const highConfidencePlatformsByPage = new Map();
+for (const pr of pageResults) {
+  for (const sig of pr.platformSignals) {
+    if (sig.confidence !== 'high') continue;
+    if (!highConfidencePlatformsByPage.has(sig.platform)) highConfidencePlatformsByPage.set(sig.platform, []);
+    highConfidencePlatformsByPage.get(sig.platform).push(pr.url);
+  }
+}
+const distinctHighConfidencePlatforms = [...highConfidencePlatformsByPage.keys()];
+if (distinctHighConfidencePlatforms.length > 1) {
+  statusMsg('🧬', c.brightYellow, `Multiple platforms detected across scanned pages: ${distinctHighConfidencePlatforms.join(', ')}`);
+  addFinding({
+    category: 'multi-platform',
+    severity: 'info',
+    title: `Multiple distinct platforms detected: ${distinctHighConfidencePlatforms.join(', ')}`,
+    detail: distinctHighConfidencePlatforms.map((p) => `${p}: ${highConfidencePlatformsByPage.get(p).slice(0, 3).join(', ')}`).join(' | ') + '. This suggests a hybrid architecture (e.g. a CMS-driven marketing site alongside a separately-built app) — each platform has its own patching/CVE surface and should be tracked independently. Scan with --crawl and a higher --max-pages for a more complete picture; a single-page scan can only see whatever platform served that one page.',
+    url: site,
+  });
+} else if (pageResults.length > 1) {
+  statusMsg('🧬', c.dim, 'Consistent platform across scanned pages — no hybrid architecture detected.');
+}
+
+// Distinct Server/X-Powered-By headers across different pages — a complementary signal to the
+// same-URL repeated-request check above: this one catches "different sections of the site are
+// served by different backends," not "this one URL is behind a load-balanced fleet."
+const distinctServersAcrossPages = new Set(pageHeaderSets.map((p) => p.server).filter(Boolean));
+const distinctPoweredByAcrossPages = new Set(pageHeaderSets.map((p) => p.poweredBy).filter(Boolean));
+if (distinctServersAcrossPages.size > 1 || distinctPoweredByAcrossPages.size > 1) {
+  const breakdown = pageHeaderSets.map((p) => `${p.url} → Server: ${p.server || 'n/a'}${p.poweredBy ? `, X-Powered-By: ${p.poweredBy}` : ''}`).join(' | ');
+  statusMsg('🖥️', c.brightYellow, `Different pages report different backend headers — likely multiple servers/apps behind the same domain.`);
+  addFinding({ category: 'infra-topology', severity: 'info', title: 'Different scanned pages report different backend server headers', detail: `${breakdown}. Combined with the platform signals above, this points to different sections of the site being served by different applications/servers rather than one uniform backend.`, url: site });
+}
 
 const libraries = identifyLibraries([...allScriptUrls, ...allStyleUrls]);
 statusMsg('📚', c.dim, `${libraries.length} known front-end librar${libraries.length === 1 ? 'y' : 'ies'} detected.`);

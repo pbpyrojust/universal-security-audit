@@ -43,6 +43,20 @@ export function detectPlatform({ html = '', headers = {}, scriptSrcs = [], cooki
   if (h.includes('__next') || h.includes('/_next/static/')) add('Next.js (React)', 'high', '_next/static asset paths found.');
   if (h.includes('data-reactroot') || h.includes('__nuxt')) add('Nuxt/React SPA', 'medium', 'SPA framework hydration markers found.');
 
+  const xRuntime = get('x-runtime');
+  const hasRailsCsrfTags = /name=["']csrf-param["']/.test(h) && /name=["']csrf-token["']/.test(h);
+  const hasAuthenticityTokenField = /name=["']authenticity_token["']/.test(h);
+  const hasRailsSessionCookie = cookieNames.some((n) => /^_[\w-]+_session$/i.test(n));
+  if (xRuntime || hasRailsCsrfTags || hasAuthenticityTokenField || hasRailsSessionCookie) {
+    const strongSignal = xRuntime || hasRailsCsrfTags;
+    add('Ruby on Rails', strongSignal ? 'high' : 'medium', [
+      xRuntime && 'X-Runtime header present',
+      hasRailsCsrfTags && 'csrf-param/csrf-token meta tags found',
+      hasAuthenticityTokenField && 'authenticity_token form field found',
+      hasRailsSessionCookie && 'Rails-style _appname_session cookie found',
+    ].filter(Boolean).join('; ') + '.');
+  }
+
   signals.sort((a, b) => (b.confidence === 'high') - (a.confidence === 'high'));
   return signals.length ? signals : [{ platform: 'Unknown/Custom', confidence: 'low', reason: 'No known CMS/platform signature matched.' }];
 }

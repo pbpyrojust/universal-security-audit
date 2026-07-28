@@ -12,7 +12,14 @@ This tool actively sends requests to well-known admin/login/config paths, DNS-pr
 
 **Security headers** — A+–F grade covering CSP, HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, COOP/CORP, `Server`/`X-Powered-By` version disclosure, and cookie `Secure`/`HttpOnly`/`SameSite` flags.
 
-**Platform & infrastructure fingerprinting** — CMS/platform detection (WordPress, Drupal, Joomla, Shopify, Squarespace, Wix, Webflow, Magento, Next.js/SPA); hosting/CDN detection (Cloudflare, Vercel, Netlify, Fastly, AWS S3/CloudFront, GitHub Pages, Pantheon, WP Engine, origin Apache/nginx); DNS records (A/AAAA/MX/NS/TXT); TLS certificate expiry and trust chain.
+**Platform & infrastructure fingerprinting** — CMS/platform detection (WordPress, Drupal, Joomla, Shopify, Squarespace, Wix, Webflow, Magento, Ruby on Rails, Next.js/SPA); hosting/CDN detection (Cloudflare, Vercel, Netlify, Fastly, AWS S3/CloudFront, GitHub Pages, Pantheon, WP Engine, origin Apache/nginx); DNS records (A/AAAA/MX/NS/TXT); TLS certificate expiry and trust chain. Rails is detected via its CSRF meta tags (`csrf-param`/`csrf-token`), `authenticity_token` form fields, the `X-Runtime` header, or its default `_appname_session` cookie naming convention.
+
+**Multi-platform / hybrid-architecture detection** — platform signals and backend headers (`Server`/`X-Powered-By`) are compared *across every scanned page*, not just the homepage. A different high-confidence platform (or a different backend header) showing up on a different page is reported as a likely hybrid architecture (e.g. a WordPress marketing site with a separately-built donation/fundraising app) — each stack has its own patching surface and CVE exposure. This only works as well as your page coverage: use `--crawl` with a reasonable `--max-pages` for sites you suspect might be hybrid, since a single-page scan can only ever see whichever platform served that one page.
+
+**Multi-server / reverse-proxy detection** — three complementary signals, all built from data the tool is already collecting or a handful of extra plain GETs to the homepage:
+- **Reverse proxy indicators**: a `Via` header, or seeing both a CDN/edge signal (Cloudflare, Fastly, etc.) and an origin-server signal (nginx/Apache) in the same response
+- **DNS load-balancing hint**: more than one A record with no recognized CDN in front (CDNs also return multiple IPs, but those are edge nodes, not your own servers — already excluded)
+- **Response-header consistency**: several repeated requests to the homepage compared for `Server`/`X-Powered-By`/`Via`/`X-Served-By` differences — inconsistent answers to the same URL over time is a solid signal of multiple backend instances behind a load balancer that may not be equally patched/configured
 
 **TLS protocol enumeration** — actually handshakes with the server pinned to each of TLS 1.0/1.1/1.2/1.3 (rather than only reporting whatever one default connection negotiated) and flags legacy protocols that are still accepted. Note: forcing specific *weak cipher suites* (RC4/3DES/NULL/export-grade) isn't included — modern Node's bundled OpenSSL has those compiled out entirely, so we cannot reliably ask a server that question from this client; claiming to test for them would risk a false "not vulnerable" reading.
 
@@ -44,7 +51,7 @@ This tool actively sends requests to well-known admin/login/config paths, DNS-pr
 
 **Payment/donation detection** — Stripe, PayPal, Square, Donorbox, Classy, Network for Good, GiveWP, WooCommerce, Shopify Checkout, Venmo, Braintree, Authorize.Net, Kindful, Bloomerang, Convio/Luminate, plus card-input-without-recognized-processor detection.
 
-**CORS misconfiguration, mixed content, and AI/SEO-crawler exposure** — reflected-Origin + credentials CORS check; `http://` resources on HTTPS pages; what `robots.txt`/`llms.txt`/sitemap reveal publicly (including sensitive-looking `Disallow` paths, which are visible to attackers and AI scrapers even though they aren't blocked).
+**CORS misconfiguration, mixed content, and AI/SEO-crawler exposure** — reflected-Origin + credentials CORS check; `http://` resources on HTTPS pages; what `robots.txt`/`llms.txt`/sitemap reveal publicly (including sensitive-looking `Disallow` paths, which are visible to attackers and AI scrapers even though they aren't blocked). Sitemap discovery reads any `Sitemap:` directive(s) in `robots.txt` first (taking priority over guessing `sitemap_index.xml`/`wp-sitemap.xml`/`sitemap.xml`), and cross-checks the two: it flags when a working sitemap exists but isn't declared in `robots.txt` (crawlers that only read `robots.txt` for sitemap discovery would miss it) and when `robots.txt` declares a sitemap URL that doesn't actually resolve.
 
 ## Authenticated admin audit (opt-in, WordPress + Drupal)
 

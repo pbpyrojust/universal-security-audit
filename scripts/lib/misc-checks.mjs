@@ -35,7 +35,11 @@ export function findMixedContent(html = '', pageUrl = '') {
   return { applicable: true, refs: [...refs] };
 }
 
-export async function summarizeCrawlerExposure(origin) {
+// `sitemapInfo` (optional) is the result already computed by Phase 1's URL discovery
+// ({ sitemapUrl, robotsDeclaredSitemaps, sitemapDeclaredInRobots }) — passed in so this function
+// doesn't redundantly re-guess sitemap paths and risk reporting a different answer than what the
+// rest of the run actually used.
+export async function summarizeCrawlerExposure(origin, sitemapInfo = null) {
   const fetchText = async (p) => {
     try {
       const res = await fetch(new URL(p, origin).toString(), { headers: { 'user-agent': 'Universal-Security-Audit' } });
@@ -44,17 +48,27 @@ export async function summarizeCrawlerExposure(origin) {
   };
   const robots = await fetchText('/robots.txt');
   const llms = await fetchText('/llms.txt');
-  const sitemap = await fetchText('/sitemap.xml');
 
   const disallowedPaths = robots
     ? [...robots.matchAll(/^disallow:\s*(.+)$/gim)].map((m) => m[1].trim()).filter((p) => p && p !== '/')
     : [];
   const sensitiveLookingDisallows = disallowedPaths.filter((p) => /admin|login|wp-|config|backup|private|internal|staging|test|debug/i.test(p));
+  const robotsDeclaredSitemaps = robots ? [...robots.matchAll(/^sitemap:\s*(\S+)$/gim)].map((m) => m[1].trim()) : [];
+
+  const hasSitemap = sitemapInfo ? !!sitemapInfo.sitemapUrl : null;
+  const sitemapDeclaredInRobots = sitemapInfo ? !!sitemapInfo.sitemapDeclaredInRobots : robotsDeclaredSitemaps.length > 0;
+  const sitemapUndeclaredButReachable = hasSitemap && robotsDeclaredSitemaps.length > 0 && !sitemapDeclaredInRobots;
+  const sitemapDeclaredButUnreachable = robotsDeclaredSitemaps.length > 0 && !hasSitemap;
 
   return {
     hasRobots: !!robots,
     hasLlmsTxt: !!llms,
-    hasSitemap: !!sitemap,
+    hasSitemap,
+    sitemapUrl: sitemapInfo?.sitemapUrl || null,
+    robotsDeclaredSitemaps,
+    sitemapDeclaredInRobots,
+    sitemapUndeclaredButReachable,
+    sitemapDeclaredButUnreachable,
     disallowedPathCount: disallowedPaths.length,
     sensitiveLookingDisallows,
     note: sensitiveLookingDisallows.length
