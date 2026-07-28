@@ -223,7 +223,9 @@ if (!args.site) { console.error('Missing --site'); process.exit(1); }
 const site = normalizeUrl(args.site);
 const origin = new URL(site).origin;
 const hostname = new URL(site).hostname;
-const maxPages = args['max-pages'] ? Number(args['max-pages']) : 10;
+// No --max-pages means no limit: crawl/sitemap discovery runs until it exhausts reachable
+// pages/sitemap entries rather than silently capping at some default.
+const maxPages = args['max-pages'] ? Number(args['max-pages']) : Infinity;
 const slowMode = Boolean(args['slow']);
 const respectRobots = Boolean(args['respect-robots']);
 const skipExposedPaths = Boolean(args['skip-exposed-paths']);
@@ -335,6 +337,7 @@ const discStart = Date.now();
 let pageUrls = [site];
 let sitemapDiscovery = { sitemapUrl: null, robotsDeclaredSitemaps: [], sitemapDeclaredInRobots: false };
 if (args['crawl']) {
+  if (!Number.isFinite(maxPages)) statusMsg('🕷️', c.dim, 'No --max-pages set — crawling until every reachable internal link is exhausted (pass --max-pages to cap this on large sites).');
   pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl });
   statusMsg('🕷️', c.brightGreen, `Crawled ${pageUrls.length} page(s) via link-following.`);
 } else {

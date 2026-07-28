@@ -101,7 +101,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | Flag | Description |
 | --- | --- |
 | `--site <url>` | **(required)** Target website URL |
-| `--max-pages <n>` | Max pages to scan (default 10) |
+| `--max-pages <n>` | Max pages to scan. Omit it and there's no limit — sitemap discovery pulls every URL it finds, and `--crawl` follows links until it exhausts the site; pass a number to cap either one on large sites |
 | `--crawl` | Discover pages by following internal links instead of using the sitemap |
 | `--slow` | Conservative mode: longer waits between requests |
 | `--respect-robots` | Skip URLs/paths disallowed by robots.txt |
