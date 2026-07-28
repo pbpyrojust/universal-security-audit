@@ -53,6 +53,8 @@ Examples:
 
 Key flags (see README for the full list):
   --intensity light|normal|aggressive   Concurrency/delay/probe-size dial
+  --max-pages <n>                       Cap pages scanned (default: no limit)
+  --max-per-url-pattern <n>              Crawl-trap guard, default 3 (per-record pages, etc.)
   --wordlist <path>                     Extra paths to probe, one per line
   --skip-port-scan / --skip-subdomain-enum / --skip-whois / --skip-admin-audit
   --auth-config <path> | --login-url/--username/--password   Enables authenticated admin audit

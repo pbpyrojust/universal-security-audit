@@ -103,6 +103,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | `--site <url>` | **(required)** Target website URL |
 | `--max-pages <n>` | Max pages to scan. Omit it and there's no limit — sitemap discovery pulls every URL it finds, and `--crawl` follows links until it exhausts the site; pass a number to cap either one on large sites |
 | `--crawl` | Discover pages by following internal links instead of using the sitemap |
+| `--max-per-url-pattern <n>` | Crawl-trap guard (default 3): caps how many pages matching the same URL "shape" get crawled — path segments that look like IDs/hashes/years (`/participants/mypage/1174017/2026`) are collapsed to a placeholder (`/participants/mypage/:id/:id`) for this comparison, so a site with thousands of per-record pages (fundraiser pages, product pages, forum threads) doesn't turn an uncapped `--crawl` into tens of thousands of near-duplicate requests |
 | `--slow` | Conservative mode: longer waits between requests |
 | `--respect-robots` | Skip URLs/paths disallowed by robots.txt |
 | `--intensity <light\|normal\|aggressive>` | One dial for concurrency/delay/probe-list-size across path probing, port scanning, and subdomain liveness checks (default `normal`) |

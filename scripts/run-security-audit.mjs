@@ -269,6 +269,10 @@ const hostname = new URL(site).hostname;
 // No --max-pages means no limit: crawl/sitemap discovery runs until it exhausts reachable
 // pages/sitemap entries rather than silently capping at some default.
 const maxPages = args['max-pages'] ? Number(args['max-pages']) : Infinity;
+// Caps how many pages matching the same URL "shape" (e.g. /participants/mypage/:id/:id) get
+// crawled — without this, sites with per-record pages (fundraiser pages, product pages, forum
+// threads, etc.) turn an uncapped --crawl into a crawl trap of thousands of near-duplicate pages.
+const maxPerTemplate = args['max-per-url-pattern'] ? Number(args['max-per-url-pattern']) : 3;
 const slowMode = Boolean(args['slow']);
 const respectRobots = Boolean(args['respect-robots']);
 const skipExposedPaths = Boolean(args['skip-exposed-paths']);
@@ -351,11 +355,30 @@ async function discoverUrlsFromSitemap(site) {
     sitemapDeclaredInRobots: !!sitemapUrl && robotsDeclaredSitemaps.includes(sitemapUrl),
   };
 }
-async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
+// Collapses path segments that look like IDs/hashes/years into a placeholder so URLs that are
+// really "the same page template with a different record" (e.g. /participants/mypage/1174017/2026)
+// get recognized as one pattern rather than each counting as a distinct page to crawl.
+function urlTemplate(url) {
+  try {
+    const u = new URL(url);
+    const segments = u.pathname.split('/').map((seg) => {
+      if (!seg) return seg;
+      if (/^\d+$/.test(seg)) return ':id';
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return ':uuid';
+      if (seg.length > 12 && /[a-z]/i.test(seg) && /\d/.test(seg)) return ':hash';
+      return seg;
+    });
+    return segments.join('/');
+  } catch { return url; }
+}
+
+async function crawlForUrls(site, { maxPages, isAllowedUrl, maxPerTemplate = 3 }) {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
   const seen = new Set([site]);
   const queue = [site];
+  const templateCounts = new Map();
+  let skippedByTemplate = 0;
   const crawlStart = Date.now();
   while (queue.length && seen.size < maxPages) {
     const url = queue.shift();
@@ -367,16 +390,21 @@ async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
         if (!sameOrigin(abs, site) || !isCrawlablePage(abs) || seen.has(abs)) continue;
         if (isAllowedUrl && !isAllowedUrl(abs)) continue;
         if (seen.size >= maxPages) break;
+        const template = urlTemplate(abs);
+        const count = templateCounts.get(template) || 0;
+        if (count >= maxPerTemplate) { skippedByTemplate++; continue; }
+        templateCounts.set(template, count + 1);
         seen.add(abs);
         queue.push(abs);
       }
     } catch {}
     const shortUrl = url.length > 60 ? url.slice(0, 57) + '...' : url;
-    const extra = `${c.dim}queue:${c.reset} ${c.brightYellow}${queue.length}${c.reset} ${c.dim}·${c.reset} elapsed ${c.brightYellow}${formatDuration(Date.now() - crawlStart)}${c.reset} ${c.dim}·${c.reset} ${shortUrl}`;
+    const extra = `${c.dim}queue:${c.reset} ${c.brightYellow}${queue.length}${c.reset} ${c.dim}·${c.reset} elapsed ${c.brightYellow}${formatDuration(Date.now() - crawlStart)}${c.reset}${skippedByTemplate ? ` ${c.dim}·${c.reset} skipped ${c.brightYellow}${skippedByTemplate}${c.reset} repeat-template pages` : ''} ${c.dim}·${c.reset} ${shortUrl}`;
     progressLine(seen.size, maxPages, 'pages found', extra);
   }
   clearProgressLine();
   await browser.close();
+  if (skippedByTemplate) statusMsg('🪤', c.dim, `Skipped ${skippedByTemplate} additional page(s) that matched an already-sampled URL template (e.g. paginated/per-record pages) — capped at ${maxPerTemplate} per template to avoid a crawl trap. Use --max-per-url-pattern to change this.`);
   return [...seen];
 }
 
@@ -386,7 +414,7 @@ let pageUrls = [site];
 let sitemapDiscovery = { sitemapUrl: null, robotsDeclaredSitemaps: [], sitemapDeclaredInRobots: false };
 if (args['crawl']) {
   if (!Number.isFinite(maxPages)) statusMsg('🕷️', c.dim, 'No --max-pages set — crawling until every reachable internal link is exhausted (pass --max-pages to cap this on large sites).');
-  pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl });
+  pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl, maxPerTemplate });
   statusMsg('🕷️', c.brightGreen, `Crawled ${pageUrls.length} page(s) via link-following.`);
 } else {
   try {
