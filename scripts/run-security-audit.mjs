@@ -206,6 +206,49 @@ function phaseHeader(label, icon = '▸') {
 }
 function phaseDone(label, elapsed) { out(`    ${c.brightGreen}✔${c.reset} ${label} ${c.dim}in${c.reset} ${c.brightYellow}${formatDuration(elapsed)}${c.reset}`); }
 function statusMsg(icon, color, msg) { out(`    ${color}${icon}${c.reset} ${msg}`); }
+
+// Live in-place progress (carriage-return updates, no trailing newline) — same pattern as
+// universal-seo-audit/universal-accessibility-audit. Writes to stderr instead of stdout when
+// --json is set, same reasoning as out() above: keep stdout reserved for the final JSON document.
+function progressWrite(str) { (jsonOut ? process.stderr : process.stdout).write(str); }
+function clearProgressLine() { progressWrite('\r\x1b[K'); }
+const spinnerFrames = ['◐', '◓', '◑', '◒'];
+let spinnerIdx = 0;
+function spinner() { return rainbowColors[spinnerIdx % rainbowColors.length] + spinnerFrames[spinnerIdx++ % spinnerFrames.length] + c.reset; }
+function rainbowBar(filled, empty, width = 30) {
+  const chars = [];
+  for (let i = 0; i < filled; i++) chars.push(`${rainbowColors[i % rainbowColors.length]}█`);
+  return chars.join('') + `${c.dim}${'░'.repeat(Math.max(0, empty))}${c.reset}`;
+}
+// `total` may be Infinity/0/undefined for indeterminate work — falls back to a spinner + count with
+// no bar/percentage in that case, rather than dividing by a non-finite/zero total.
+function progressLine(current, total, label, extra = '') {
+  const hasTotal = Number.isFinite(total) && total > 0;
+  const done = hasTotal && current >= total;
+  const spin = done ? `${c.brightGreen}✔${c.reset}` : spinner();
+  if (!hasTotal) {
+    progressWrite(`\r  ${spin} ${c.bold}${current}${c.reset} ${c.dim}${label}${c.reset}${extra ? ' ' + extra : ''}\x1b[K`);
+    return;
+  }
+  const pct = Math.min(100, Math.round((current / total) * 100));
+  const barWidth = 30;
+  const filled = Math.min(barWidth, Math.round((current / total) * barWidth));
+  const bar = rainbowBar(filled, barWidth - filled, barWidth);
+  const pctStr = pct === 100 ? `${c.brightGreen}${pct}%${c.reset}` : `${c.brightCyan}${pct}%${c.reset}`;
+  progressWrite(`\r  ${spin} ${bar} ${c.bold}${current}${c.reset}${c.dim}/${total}${c.reset} ${pctStr} ${c.dim}${label}${c.reset}${extra ? ' ' + extra : ''}\x1b[K`);
+}
+// For a single indeterminate wait (e.g. one slow external API call) rather than an iterable loop —
+// ticks a spinner + elapsed time every 250ms until `promise` settles, then clears the line.
+async function withTicker(promise, label) {
+  const start = Date.now();
+  const timer = setInterval(() => progressWrite(`\r  ${spinner()} ${c.dim}${label}...${c.reset} ${c.brightYellow}${formatDuration(Date.now() - start)}${c.reset}\x1b[K`), 250);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(timer);
+    clearProgressLine();
+  }
+}
 function sevColor(sev) {
   const map = { critical: c.brightRed, high: c.red, medium: c.brightYellow, low: c.yellow, info: c.dim };
   return `${map[sev] || c.dim}${sev.toUpperCase()}${c.reset}`;
@@ -313,6 +356,7 @@ async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
   const page = await browser.newPage();
   const seen = new Set([site]);
   const queue = [site];
+  const crawlStart = Date.now();
   while (queue.length && seen.size < maxPages) {
     const url = queue.shift();
     try {
@@ -327,7 +371,11 @@ async function crawlForUrls(site, { maxPages, isAllowedUrl }) {
         queue.push(abs);
       }
     } catch {}
+    const shortUrl = url.length > 60 ? url.slice(0, 57) + '...' : url;
+    const extra = `${c.dim}queue:${c.reset} ${c.brightYellow}${queue.length}${c.reset} ${c.dim}·${c.reset} elapsed ${c.brightYellow}${formatDuration(Date.now() - crawlStart)}${c.reset} ${c.dim}·${c.reset} ${shortUrl}`;
+    progressLine(seen.size, maxPages, 'pages found', extra);
   }
+  clearProgressLine();
   await browser.close();
   return [...seen];
 }
@@ -463,7 +511,7 @@ let whois = { checked: false };
 if (!skipWhois) {
   phaseHeader('Phase 4: WHOIS / domain registration', '📇');
   const whoisStart = Date.now();
-  whois = await rdapLookup(apexDomain);
+  whois = await withTicker(rdapLookup(apexDomain), 'Querying RDAP for domain registration');
   if (whois.checked) {
     statusMsg('📇', c.dim, `Registrar: ${whois.registrar || 'unknown'} · expires ${whois.expiration ? new Date(whois.expiration).toISOString().slice(0, 10) : 'unknown'}`);
     if (whois.isExpired) addFinding({ category: 'domain-registration', severity: 'critical', title: 'Domain registration has expired', detail: `Registrar: ${whois.registrar || 'unknown'}. Expired ${-whois.daysUntilExpiration} day(s) ago — the domain can be lost/hijacked.`, url: `whois:${apexDomain}` });
@@ -481,12 +529,16 @@ let discoveredSubdomains = [];
 if (!skipSubdomainEnum) {
   phaseHeader('Phase 5: Subdomain enumeration', '🌐');
   const subStart = Date.now();
-  const enumResult = await enumerateSubdomainsCrtSh(apexDomain);
+  const enumResult = await withTicker(enumerateSubdomainsCrtSh(apexDomain), 'Querying crt.sh certificate-transparency logs');
   if (enumResult.checked) {
     discoveredSubdomains = enumResult.subdomains;
     statusMsg('🌐', c.brightGreen, `Found ${discoveredSubdomains.length} subdomain(s) via certificate-transparency logs.`);
     if (discoveredSubdomains.length) {
-      const liveness = await checkLiveness(discoveredSubdomains, { limit: intensity.subdomainLivenessLimit });
+      const liveness = await checkLiveness(discoveredSubdomains, {
+        limit: intensity.subdomainLivenessLimit,
+        onProgress: (done, total) => progressLine(done, total, 'subdomains checked'),
+      });
+      clearProgressLine();
       const alive = liveness.filter((l) => l.alive);
       statusMsg('🌐', c.dim, `${alive.length}/${liveness.length} checked subdomain(s) responded (out of ${discoveredSubdomains.length} discovered total).`);
       addFinding({ category: 'subdomain-enum', severity: 'info', title: `${discoveredSubdomains.length} subdomain(s) discovered via certificate-transparency logs`, detail: `Expands the known attack surface beyond the scanned host. Live examples: ${alive.slice(0, 8).map((a) => a.host).join(', ') || 'none checked'}`, url: `https://crt.sh/?q=%25.${apexDomain}` });
@@ -504,7 +556,11 @@ let portResults = [];
 if (!skipPortScan) {
   phaseHeader('Phase 6: Port scan', '🔌');
   const portStart = Date.now();
-  portResults = await scanPorts(hostname, intensity.portScan);
+  portResults = await scanPorts(hostname, {
+    ...intensity.portScan,
+    onProgress: (done, total, result) => progressLine(done, total, 'ports scanned', result.state === 'open' ? `${c.brightYellow}open: ${result.port} (${result.name})${c.reset}` : ''),
+  });
+  clearProgressLine();
   const open = portResults.filter((r) => r.state === 'open');
   statusMsg('🔌', open.length ? c.brightYellow : c.brightGreen, `${open.length}/${portResults.length} scanned port(s) open.`);
   for (const p of open) {
@@ -537,7 +593,13 @@ if (!skipExposedPaths) {
       statusMsg('⚠', c.brightYellow, `Could not read --wordlist: ${String(e?.message || e)}`);
     }
   }
-  pathResults = await probeAllPaths(origin, allPaths, { isAllowedUrl: respectRobots ? robotsCfg.isAllowedUrl : null, delayMs: slowMode ? 400 : intensity.exposedPathDelayMs, concurrency: intensity.exposedPathConcurrency });
+  pathResults = await probeAllPaths(origin, allPaths, {
+    isAllowedUrl: respectRobots ? robotsCfg.isAllowedUrl : null,
+    delayMs: slowMode ? 400 : intensity.exposedPathDelayMs,
+    concurrency: intensity.exposedPathConcurrency,
+    onProgress: (done, total, result) => progressLine(done, total, 'paths probed', result.exists ? `${c.brightYellow}found: ${result.path}${c.reset}` : ''),
+  });
+  clearProgressLine();
   const exposed = pathResults.filter((r) => r.exists);
   for (const r of exposed) {
     const isAdminLogin = ADMIN_LOGIN_PATHS.some((p) => p.path === r.path);
@@ -877,31 +939,42 @@ let reconFindings = [];
 if (!skipRecon) {
   phaseHeader('Phase 13: Recon-phase checks', '🕵️');
   const reconStart = Date.now();
+  const reconSteps = primaryPlatform === 'WordPress' ? 7 : 6;
+  let reconStep = 0;
+  const tickRecon = (label) => progressLine(++reconStep, reconSteps, label);
 
+  tickRecon('subdomain takeover');
   const takeovers = await checkSubdomainTakeover(hostname);
   for (const t of takeovers) addFinding({ category: 'subdomain-takeover', severity: 'critical', title: `Possible subdomain takeover: ${t.host}`, detail: t.note, url: `http://${t.host}/` });
 
+  tickRecon('HTTP method exposure');
   const httpMethods = await checkHttpMethods(site);
   if (httpMethods.checked && httpMethods.risky.length) addFinding({ category: 'http-methods', severity: 'medium', title: `Risky HTTP method(s) allowed: ${httpMethods.risky.join(', ')}`, detail: `Full Allow list: ${httpMethods.methods.join(', ') || '(none advertised)'}`, url: site });
 
+  tickRecon('open redirect probing');
   const openRedirects = await checkOpenRedirect(origin);
   for (const r of openRedirects) addFinding({ category: 'open-redirect', severity: 'medium', title: `Open redirect via "${r.param}" parameter`, detail: `Redirects to attacker-controlled URL: ${r.location}`, url: r.testUrl });
 
+  tickRecon('exposed source maps');
   const sourceMaps = await checkExposedSourceMaps(allScriptUrls);
   if (sourceMaps.length) addFinding({ category: 'source-map', severity: 'low', title: `${sourceMaps.length} exposed source map(s) (.js.map)`, detail: `Source maps can reveal original (unminified) source code. Examples: ${sourceMaps.slice(0, 3).join(', ')}`, url: sourceMaps[0] });
 
+  tickRecon('SPF/DMARC records');
   const emailAuth = await checkEmailAuthRecords(hostname, dnsRecords.txt || []);
   if (!emailAuth.hasSpf) addFinding({ category: 'email-auth', severity: 'low', title: 'No SPF record found', detail: 'Without SPF, attackers can more easily spoof email "From" addresses on this domain.', url: `dns:${hostname}` });
   if (!emailAuth.hasDmarc) addFinding({ category: 'email-auth', severity: 'low', title: 'No DMARC record found', detail: 'Without DMARC, spoofed/phishing email using this domain is not rejected or reported.', url: `dns:_dmarc.${hostname}` });
   else if (emailAuth.dmarcPolicy === 'none') addFinding({ category: 'email-auth', severity: 'info', title: 'DMARC policy is "p=none" (monitor-only)', detail: 'DMARC is present but not enforcing rejection/quarantine of spoofed mail.', url: `dns:_dmarc.${hostname}` });
 
   if (primaryPlatform === 'WordPress') {
+    tickRecon('WordPress user enumeration');
     const authors = await enumerateWpAuthors(origin);
     if (authors.length) addFinding({ category: 'user-enum', severity: 'medium', title: `${authors.length} WordPress username(s) enumerable via ?author=N`, detail: authors.map((a) => `id ${a.id} → ${a.username}`).join(', '), url: `${origin}/?author=1` });
   }
 
+  tickRecon('verbose error disclosure');
   const verboseErrors = await checkVerboseErrors(origin);
   if (verboseErrors.checked && verboseErrors.leaksStackTrace) addFinding({ category: 'verbose-errors', severity: 'medium', title: 'Error pages leak stack traces / framework debug info', detail: `Sample: "${verboseErrors.sample.replace(/\s+/g, ' ').slice(0, 200)}"`, url: origin });
+  clearProgressLine();
 
   reconFindings = [...takeovers, ...openRedirects, ...sourceMaps];
   statusMsg('🕵️', c.dim, `Recon checks complete: ${takeovers.length} takeover signal(s), ${openRedirects.length} open redirect(s), ${sourceMaps.length} exposed source map(s).`);

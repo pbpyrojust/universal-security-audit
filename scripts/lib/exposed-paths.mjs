@@ -92,14 +92,17 @@ export async function probePath(origin, entry, { timeoutMs = 8000, userAgent = '
   }
 }
 
-export async function probeAllPaths(origin, entries, { concurrency = 4, delayMs = 150, isAllowedUrl = null, ...opts } = {}) {
+export async function probeAllPaths(origin, entries, { concurrency = 4, delayMs = 150, isAllowedUrl = null, onProgress = null, ...opts } = {}) {
   const results = [];
   const queue = entries.filter((e) => !isAllowedUrl || isAllowedUrl(new URL(e.path, origin).toString()));
+  const total = queue.length;
   let idx = 0;
   async function worker() {
     while (idx < queue.length) {
       const entry = queue[idx++];
-      results.push(await probePath(origin, entry, opts));
+      const result = await probePath(origin, entry, opts);
+      results.push(result);
+      if (onProgress) onProgress(results.length, total, result);
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
     }
   }

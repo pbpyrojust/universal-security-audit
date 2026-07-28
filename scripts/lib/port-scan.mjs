@@ -55,14 +55,16 @@ function connectScan(host, port, timeoutMs) {
   });
 }
 
-export async function scanPorts(host, { ports = COMMON_SERVICE_PORTS, concurrency = 20, timeoutMs = 1800 } = {}) {
+export async function scanPorts(host, { ports = COMMON_SERVICE_PORTS, concurrency = 20, timeoutMs = 1800, onProgress = null } = {}) {
   const results = [];
   const queue = [...ports];
+  const total = queue.length;
   async function worker() {
     while (queue.length) {
       const entry = queue.shift();
       const r = await connectScan(host, entry.port, timeoutMs);
       results.push({ ...entry, ...r });
+      if (onProgress) onProgress(results.length, total, { ...entry, ...r });
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, queue.length || 1) }, worker));

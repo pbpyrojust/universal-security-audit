@@ -37,15 +37,16 @@ export async function enumerateSubdomainsCrtSh(domain, { timeoutMs = 20000, retr
   return { checked: false, error: lastError, subdomains: [] };
 }
 
-export async function checkLiveness(hostnames = [], { limit = 15, concurrency = 8, timeoutMs = 5000 } = {}) {
+export async function checkLiveness(hostnames = [], { limit = 15, concurrency = 8, timeoutMs = 5000, onProgress = null } = {}) {
   const queue = hostnames.slice(0, limit);
+  const total = queue.length;
   const results = [];
   async function worker() {
     while (queue.length) {
       const host = queue.shift();
       let resolved = false;
       try { await dns.resolve(host); resolved = true; } catch {}
-      if (!resolved) { results.push({ host, alive: false, resolved: false }); continue; }
+      if (!resolved) { results.push({ host, alive: false, resolved: false }); if (onProgress) onProgress(results.length, total, { host, alive: false }); continue; }
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -55,6 +56,7 @@ export async function checkLiveness(hostnames = [], { limit = 15, concurrency = 
       } catch {
         results.push({ host, alive: false, resolved: true });
       }
+      if (onProgress) onProgress(results.length, total, results[results.length - 1]);
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, queue.length || 1) }, worker));
