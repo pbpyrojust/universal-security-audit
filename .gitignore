@@ -25,6 +25,12 @@ build/
 .env
 .env.*
 
+# Local credential/config files (keep the .example.json templates, ignore real copies)
+auth-config.json
+auth-config.local.json
+branding.json
+*.local.json
+
 # Editor
 .vscode/
 .idea/

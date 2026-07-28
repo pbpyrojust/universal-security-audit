@@ -13,13 +13,23 @@ import {
 import { npmPackageNameFor, osvLookup, wpscanCoreLookup, wpscanPluginLookup, wpscanThemeLookup } from './lib/vuln-lookup.mjs';
 import { scanForPii, detectPaymentProcessors } from './lib/pii-payment.mjs';
 import { checkCorsMisconfig, findMixedContent, summarizeCrawlerExposure } from './lib/misc-checks.mjs';
-import { computeRiskGrade, sortFindingsBySeverity } from './lib/scoring.mjs';
+import { computeRiskGrade, sortFindingsBySeverity, isGradeBelow, hasFindingAtOrAbove } from './lib/scoring.mjs';
 import {
   checkSubdomainTakeover, checkHttpMethods, checkOpenRedirect, checkMissingSri,
   checkExposedSourceMaps, checkEmailAuthRecords, enumerateWpAuthors,
   checkInsecureLoginForms, checkVerboseErrors, scanCookiesForJwt,
 } from './lib/pentest-recon.mjs';
 import { loadBranding, buildSecurityDashboardHtml } from './lib/report-builder.mjs';
+import { loadWordlistEntries } from './lib/exposed-paths.mjs';
+import { resolveIntensity } from './lib/intensity.mjs';
+import { scanPorts, SENSITIVE_PORTS } from './lib/port-scan.mjs';
+import { enumerateSubdomainsCrtSh, checkLiveness } from './lib/subdomain-enum.mjs';
+import { rdapLookup } from './lib/whois-lookup.mjs';
+import { configureFetchProxy, playwrightProxyOption } from './lib/proxy-support.mjs';
+import {
+  isLoggedIntoWpAdmin, scanWpPlugins, scanWpThemes, scanWpCoreAndPhp, scanWpUsers,
+  detectSecurityPlugins, checkPhpEol,
+} from './lib/wp-admin-audit.mjs';
 
 // ── CLI / generic helpers ───────────────────────────────────────────────
 function parseArgs(argv) {
@@ -112,6 +122,55 @@ async function buildRobotsMatcher(startUrl) {
   } catch { return { isAllowedUrl: null }; }
 }
 
+// ── Authenticated-scan support (HTTP basic + form login) ────────────────
+function loadAuthConfig(filePath) {
+  try { return JSON.parse(fs.readFileSync(path.resolve(process.cwd(), filePath), 'utf8')); }
+  catch (e) { throw new Error(`Could not read auth config at ${filePath}: ${String(e?.message || e)}`); }
+}
+function getAuthSettings(args) {
+  let cfg = {};
+  if (args['auth-config']) cfg = loadAuthConfig(args['auth-config']);
+  const httpUsername = args['http-username'] || process.env.USA_HTTP_USERNAME || cfg.httpUsername || '';
+  const httpPassword = args['http-password'] || process.env.USA_HTTP_PASSWORD || cfg.httpPassword || '';
+  const loginUrl = args['login-url'] || cfg.loginUrl || '';
+  const username = args['username'] || process.env.USA_LOGIN_USERNAME || cfg.username || '';
+  const password = args['password'] || process.env.USA_LOGIN_PASSWORD || cfg.password || '';
+  const usernameSelector = args['username-selector'] || cfg.usernameSelector || "input[name='log'], input[name='username'], input[type='email']";
+  const passwordSelector = args['password-selector'] || cfg.passwordSelector || "input[name='pwd'], input[name='password'], input[type='password']";
+  const submitSelector = args['submit-selector'] || cfg.submitSelector || "button[type='submit'], input[type='submit']";
+  const readySelector = args['ready-selector'] || cfg.readySelector || '';
+  const postLoginWaitMs = Number(args['post-login-wait-ms'] || cfg.postLoginWaitMs || 2000);
+  return {
+    httpCredentials: httpUsername || httpPassword ? { username: httpUsername, password: httpPassword } : null,
+    formAuth: loginUrl && username ? { loginUrl, username, password, usernameSelector, passwordSelector, submitSelector, readySelector, postLoginWaitMs } : null,
+  };
+}
+async function maybePerformFormLogin(page, formAuth, slowMode = false) {
+  if (!formAuth) return false;
+  statusMsg('🔐', c.cyan, `Attempting form login at ${formAuth.loginUrl}`);
+  try {
+    await page.goto(formAuth.loginUrl, { waitUntil: slowMode ? 'domcontentloaded' : 'networkidle', timeout: 45000 });
+    await page.locator(formAuth.usernameSelector).first().fill(formAuth.username);
+    await page.locator(formAuth.passwordSelector).first().fill(formAuth.password || '');
+    if (formAuth.submitSelector) {
+      await Promise.allSettled([
+        page.waitForLoadState(slowMode ? 'domcontentloaded' : 'networkidle', { timeout: 20000 }),
+        page.locator(formAuth.submitSelector).first().click(),
+      ]);
+    } else {
+      await page.keyboard.press('Enter');
+      await page.waitForLoadState(slowMode ? 'domcontentloaded' : 'networkidle', { timeout: 20000 }).catch(() => {});
+    }
+    if (formAuth.readySelector) await page.locator(formAuth.readySelector).first().waitFor({ state: 'visible', timeout: 20000 });
+    else await page.waitForTimeout(formAuth.postLoginWaitMs || 2000);
+    statusMsg('🔐', c.brightGreen, 'Form login step completed.');
+    return true;
+  } catch (e) {
+    statusMsg('⚠', c.brightYellow, `Form login failed: ${String(e?.message || e)}`);
+    return false;
+  }
+}
+
 // ── Terminal UI helpers (shared style with universal-seo-audit / universal-accessibility-audit) ──
 const c = {
   reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
@@ -128,12 +187,15 @@ function formatDuration(ms) {
   const m = Math.floor(s / 60), rem = s % 60;
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
 }
+// When --json is set, stdout is reserved for the final JSON document (so it can be piped to jq/etc);
+// all progress/decorative output moves to stderr instead of being suppressed outright.
+function out(line) { (jsonOut ? console.error : console.log)(line); }
 function phaseHeader(label, icon = '▸') {
-  console.log('');
-  console.log(`  ${rainbow(icon)} ${c.bold}${c.brightCyan}${label}${c.reset} ${c.dim}${'─'.repeat(Math.max(0, 52 - label.length))}${c.reset}`);
+  out('');
+  out(`  ${rainbow(icon)} ${c.bold}${c.brightCyan}${label}${c.reset} ${c.dim}${'─'.repeat(Math.max(0, 52 - label.length))}${c.reset}`);
 }
-function phaseDone(label, elapsed) { console.log(`    ${c.brightGreen}✔${c.reset} ${label} ${c.dim}in${c.reset} ${c.brightYellow}${formatDuration(elapsed)}${c.reset}`); }
-function statusMsg(icon, color, msg) { console.log(`    ${color}${icon}${c.reset} ${msg}`); }
+function phaseDone(label, elapsed) { out(`    ${c.brightGreen}✔${c.reset} ${label} ${c.dim}in${c.reset} ${c.brightYellow}${formatDuration(elapsed)}${c.reset}`); }
+function statusMsg(icon, color, msg) { out(`    ${color}${icon}${c.reset} ${msg}`); }
 function sevColor(sev) {
   const map = { critical: c.brightRed, high: c.red, medium: c.brightYellow, low: c.yellow, info: c.dim };
   return `${map[sev] || c.dim}${sev.toUpperCase()}${c.reset}`;
@@ -157,22 +219,35 @@ const respectRobots = Boolean(args['respect-robots']);
 const skipExposedPaths = Boolean(args['skip-exposed-paths']);
 const skipCve = Boolean(args['skip-cve']);
 const skipRecon = Boolean(args['skip-recon']);
+const skipPortScan = Boolean(args['skip-port-scan']);
+const skipSubdomainEnum = Boolean(args['skip-subdomain-enum']);
+const skipWhois = Boolean(args['skip-whois']);
+const skipAdminAudit = Boolean(args['skip-admin-audit']);
 const wpscanApiKey = args['wpscan-key'] || process.env.WPSCAN_API_KEY || '';
 const branding = loadBranding(fs, path, args['brand-config']);
+const intensity = resolveIntensity(args['intensity']);
+const proxyUrl = args['proxy'] || '';
+if (proxyUrl) configureFetchProxy(proxyUrl);
+const failOn = args['fail-on'] ? String(args['fail-on']).toLowerCase() : '';
+const minGrade = args['min-grade'] ? String(args['min-grade']).toUpperCase() : '';
+const jsonOut = Boolean(args['json']);
+const authSettings = getAuthSettings(args);
 const outDir = path.resolve('reports/' + runId(site));
 fs.mkdirSync(outDir, { recursive: true });
 
 const auditStart = Date.now();
-console.log('');
-console.log(`  ${rainbow('╔══════════════════════════════════════════════════════════╗')}`);
-console.log(`  ${rainbow('║')}  ${c.bold}${c.brightRed}🛡  Universal Security Audit${c.reset}                          ${rainbow('║')}`);
-console.log(`  ${rainbow('║')}  ${c.dim}Attack Surface · Headers · CVEs · PII · Payments${c.reset}       ${rainbow('║')}`);
-console.log(`  ${rainbow('╚══════════════════════════════════════════════════════════╝')}`);
-console.log('');
-console.log(`  ${c.brightMagenta}🎯${c.reset} ${c.bold}Target:${c.reset}     ${c.brightCyan}${site}${c.reset}`);
-console.log(`  ${c.brightMagenta}📁${c.reset} ${c.bold}Output:${c.reset}     ${c.dim}${outDir}${c.reset}`);
-console.log(`  ${c.brightMagenta}🔑${c.reset} ${c.bold}WPScan key:${c.reset} ${wpscanApiKey ? `${c.brightGreen}configured${c.reset}` : `${c.dim}not set (WordPress CVE lookups will be skipped)${c.reset}`}`);
-statusMsg('⚠', c.brightYellow, 'Authorized-use only — this tool actively probes admin/config paths. Only run it against sites you own or have written permission to test.');
+out('');
+out(`  ${rainbow('╔══════════════════════════════════════════════════════════╗')}`);
+out(`  ${rainbow('║')}  ${c.bold}${c.brightRed}🛡  Universal Security Audit${c.reset}                          ${rainbow('║')}`);
+out(`  ${rainbow('║')}  ${c.dim}Attack Surface · Headers · CVEs · PII · Payments${c.reset}       ${rainbow('║')}`);
+out(`  ${rainbow('╚══════════════════════════════════════════════════════════╝')}`);
+out('');
+out(`  ${c.brightMagenta}🎯${c.reset} ${c.bold}Target:${c.reset}     ${c.brightCyan}${site}${c.reset}`);
+out(`  ${c.brightMagenta}📁${c.reset} ${c.bold}Output:${c.reset}     ${c.dim}${outDir}${c.reset}`);
+out(`  ${c.brightMagenta}🔑${c.reset} ${c.bold}WPScan key:${c.reset} ${wpscanApiKey ? `${c.brightGreen}configured${c.reset}` : `${c.dim}not set (WordPress CVE lookups will be skipped)${c.reset}`}`);
+out(`  ${c.brightMagenta}⚡${c.reset} ${c.bold}Intensity:${c.reset}  ${args['intensity'] || 'normal'}${proxyUrl ? `  ${c.dim}·${c.reset} proxying via ${proxyUrl}` : ''}`);
+if (authSettings.httpCredentials || authSettings.formAuth) console.log(`  ${c.brightMagenta}🔐${c.reset} ${c.bold}Auth:${c.reset}       ${authSettings.formAuth ? 'form login configured' : 'HTTP basic credentials configured'}`);
+statusMsg('⚠', c.brightYellow, 'Authorized-use only — this tool actively probes admin/config paths and login forms. Only run it against sites you own or have written permission to test.');
 
 let robotsCfg = { isAllowedUrl: null };
 if (respectRobots) robotsCfg = await buildRobotsMatcher(site);
@@ -250,8 +325,11 @@ phaseDone('URL discovery', Date.now() - discStart);
 // ── Phase 2: Browser setup ──────────────────────────────────────────────
 phaseHeader('Phase 2: Browser setup', '🚀');
 const setupStart = Date.now();
-const browser = await chromium.launch({ headless: true });
-const context = await browser.newContext({ userAgent: 'Mozilla/5.0 (compatible; Universal-Security-Audit/1.0)' });
+const browser = await chromium.launch({ headless: true, proxy: playwrightProxyOption(proxyUrl) });
+const context = await browser.newContext({
+  userAgent: 'Mozilla/5.0 (compatible; Universal-Security-Audit/1.0)',
+  httpCredentials: authSettings.httpCredentials || undefined,
+});
 phaseDone('Browser ready', Date.now() - setupStart);
 
 // ── Phase 3: Site-wide checks (headers, cookies, TLS, hosting, CORS, crawler exposure) ──
@@ -313,13 +391,88 @@ if (crawlerExposure.sensitiveLookingDisallows.length) {
 }
 phaseDone('Site-wide checks', Date.now() - siteWideStart);
 
-// ── Phase 4: Exposed path / admin / API discovery ───────────────────────
+const apexDomain = hostname.split('.').slice(-2).join('.');
+
+// ── Phase 4: WHOIS / domain registration ─────────────────────────────────
+let whois = { checked: false };
+if (!skipWhois) {
+  phaseHeader('Phase 4: WHOIS / domain registration', '📇');
+  const whoisStart = Date.now();
+  whois = await rdapLookup(apexDomain);
+  if (whois.checked) {
+    statusMsg('📇', c.dim, `Registrar: ${whois.registrar || 'unknown'} · expires ${whois.expiration ? new Date(whois.expiration).toISOString().slice(0, 10) : 'unknown'}`);
+    if (whois.isExpired) addFinding({ category: 'domain-registration', severity: 'critical', title: 'Domain registration has expired', detail: `Registrar: ${whois.registrar || 'unknown'}. Expired ${-whois.daysUntilExpiration} day(s) ago — the domain can be lost/hijacked.`, url: `whois:${apexDomain}` });
+    else if (whois.isExpiringSoon) addFinding({ category: 'domain-registration', severity: 'high', title: 'Domain registration expiring soon', detail: `Registrar: ${whois.registrar || 'unknown'}. Expires in ${whois.daysUntilExpiration} day(s) — renew to avoid an expiration-based takeover.`, url: `whois:${apexDomain}` });
+  } else {
+    statusMsg('⚠', c.brightYellow, `WHOIS/RDAP lookup failed: ${whois.error}`);
+  }
+  phaseDone('WHOIS / domain registration', Date.now() - whoisStart);
+} else {
+  statusMsg('⏭', c.dim, 'Skipping WHOIS/RDAP lookup (--skip-whois).');
+}
+
+// ── Phase 5: Subdomain enumeration (passive, crt.sh) ─────────────────────
+let discoveredSubdomains = [];
+if (!skipSubdomainEnum) {
+  phaseHeader('Phase 5: Subdomain enumeration', '🌐');
+  const subStart = Date.now();
+  const enumResult = await enumerateSubdomainsCrtSh(apexDomain);
+  if (enumResult.checked) {
+    discoveredSubdomains = enumResult.subdomains;
+    statusMsg('🌐', c.brightGreen, `Found ${discoveredSubdomains.length} subdomain(s) via certificate-transparency logs.`);
+    if (discoveredSubdomains.length) {
+      const liveness = await checkLiveness(discoveredSubdomains, { limit: intensity.subdomainLivenessLimit });
+      const alive = liveness.filter((l) => l.alive);
+      statusMsg('🌐', c.dim, `${alive.length}/${liveness.length} checked subdomain(s) responded (out of ${discoveredSubdomains.length} discovered total).`);
+      addFinding({ category: 'subdomain-enum', severity: 'info', title: `${discoveredSubdomains.length} subdomain(s) discovered via certificate-transparency logs`, detail: `Expands the known attack surface beyond the scanned host. Live examples: ${alive.slice(0, 8).map((a) => a.host).join(', ') || 'none checked'}`, url: `https://crt.sh/?q=%25.${apexDomain}` });
+    }
+  } else {
+    statusMsg('⚠', c.brightYellow, `Subdomain enumeration failed: ${enumResult.error} (crt.sh is a free community service and is sometimes slow/unavailable — this isn't necessarily a problem with the target)`);
+  }
+  phaseDone('Subdomain enumeration', Date.now() - subStart);
+} else {
+  statusMsg('⏭', c.dim, 'Skipping subdomain enumeration (--skip-subdomain-enum).');
+}
+
+// ── Phase 6: Port scan (TCP connect scan, common service ports) ─────────
+let portResults = [];
+if (!skipPortScan) {
+  phaseHeader('Phase 6: Port scan', '🔌');
+  const portStart = Date.now();
+  portResults = await scanPorts(hostname, intensity.portScan);
+  const open = portResults.filter((r) => r.state === 'open');
+  statusMsg('🔌', open.length ? c.brightYellow : c.brightGreen, `${open.length}/${portResults.length} scanned port(s) open.`);
+  for (const p of open) {
+    const sensitive = SENSITIVE_PORTS.has(p.port);
+    addFinding({
+      category: 'port-scan',
+      severity: sensitive ? 'high' : 'info',
+      title: `Port ${p.port} (${p.name}) is open`,
+      detail: sensitive ? `${p.name} is not normally expected to be reachable from the public internet — verify this is intentional and firewalled to trusted IPs only.${p.banner ? ` Banner: "${p.banner}"` : ''}` : `${p.banner ? `Banner: "${p.banner}"` : 'No banner volunteered.'}`,
+      url: `${hostname}:${p.port}`,
+    });
+  }
+  phaseDone('Port scan', Date.now() - portStart);
+} else {
+  statusMsg('⏭', c.dim, 'Skipping port scan (--skip-port-scan).');
+}
+
+// ── Phase 7: Exposed path / admin / API discovery ────────────────────────
 let pathResults = [];
 if (!skipExposedPaths) {
-  phaseHeader('Phase 4: Exposed path & admin/API discovery', '🔎');
+  phaseHeader('Phase 7: Exposed path & admin/API discovery', '🔎');
   const pathStart = Date.now();
-  const allPaths = [...ADMIN_LOGIN_PATHS, ...EXPOSED_FILE_PATHS, ...EXPOSED_API_PATHS];
-  pathResults = await probeAllPaths(origin, allPaths, { isAllowedUrl: respectRobots ? robotsCfg.isAllowedUrl : null, delayMs: slowMode ? 400 : 150 });
+  let allPaths = [...ADMIN_LOGIN_PATHS, ...EXPOSED_FILE_PATHS, ...EXPOSED_API_PATHS];
+  if (args['wordlist']) {
+    try {
+      const wordlistEntries = loadWordlistEntries(fs, path.resolve(process.cwd(), args['wordlist']));
+      allPaths = [...allPaths, ...wordlistEntries];
+      statusMsg('📜', c.dim, `Loaded ${wordlistEntries.length} additional path(s) from --wordlist.`);
+    } catch (e) {
+      statusMsg('⚠', c.brightYellow, `Could not read --wordlist: ${String(e?.message || e)}`);
+    }
+  }
+  pathResults = await probeAllPaths(origin, allPaths, { isAllowedUrl: respectRobots ? robotsCfg.isAllowedUrl : null, delayMs: slowMode ? 400 : intensity.exposedPathDelayMs, concurrency: intensity.exposedPathConcurrency });
   const exposed = pathResults.filter((r) => r.exists);
   for (const r of exposed) {
     const isAdminLogin = ADMIN_LOGIN_PATHS.some((p) => p.path === r.path);
@@ -338,8 +491,8 @@ if (!skipExposedPaths) {
   statusMsg('⏭', c.dim, 'Skipping exposed-path discovery (--skip-exposed-paths).');
 }
 
-// ── Phase 5: Page scanning (platform fingerprint, script inventory, PII, payments) ──
-phaseHeader('Phase 5: Page scanning', '📄');
+// ── Phase 8: Page scanning (platform fingerprint, script inventory, PII, payments) ──
+phaseHeader('Phase 8: Page scanning', '📄');
 const scanStart = Date.now();
 let allScriptUrls = [];
 let allStyleUrls = [];
@@ -389,8 +542,8 @@ for (let i = 0; i < pageUrls.length; i++) {
 }
 phaseDone('Page scanning', Date.now() - scanStart);
 
-// ── Phase 6: Platform + third-party library inventory ──────────────────
-phaseHeader('Phase 6: Platform & library inventory', '📦');
+// ── Phase 9: Platform + third-party library inventory ──────────────────
+phaseHeader('Phase 9: Platform & library inventory', '📦');
 const invStart = Date.now();
 const platformSignals = detectPlatform({ html: siteHtmlSample, headers: homepageHeaders, scriptSrcs: allScriptUrls, cookieNames: [] });
 const primaryPlatform = platformSignals[0]?.platform || 'Unknown/Custom';
@@ -419,10 +572,10 @@ if (primaryPlatform === 'WordPress') {
 }
 phaseDone('Platform & library inventory', Date.now() - invStart);
 
-// ── Phase 7: CVE / known-vulnerability lookups (OSV.dev + WPScan) ───────
+// ── Phase 10: CVE / known-vulnerability lookups (OSV.dev + WPScan) ───────
 const vulnResults = [];
 if (!skipCve) {
-  phaseHeader('Phase 7: CVE lookups (OSV.dev + WPScan)', '🛡️');
+  phaseHeader('Phase 10: CVE lookups (OSV.dev + WPScan)', '🛡️');
   const cveStart = Date.now();
 
   for (const lib of libraries) {
@@ -478,7 +631,46 @@ if (!skipCve) {
   statusMsg('⏭', c.dim, 'Skipping CVE lookups (--skip-cve).');
 }
 
-// ── Phase 8: Payment/donation summary ───────────────────────────────────
+// ── Phase 11: Authenticated admin audit (WordPress wp-admin, when credentials are supplied) ──
+let wpAdminAudit = null;
+if (!skipAdminAudit && primaryPlatform === 'WordPress' && authSettings.formAuth) {
+  phaseHeader('Phase 11: Authenticated admin audit', '🔑');
+  const adminStart = Date.now();
+  const adminPage = await context.newPage();
+  const loggedIn = await maybePerformFormLogin(adminPage, authSettings.formAuth, slowMode);
+  if (loggedIn && await isLoggedIntoWpAdmin(adminPage, origin)) {
+    const [plugins, themes, coreInfo, users] = await Promise.all([
+      scanWpPlugins(adminPage, origin),
+      scanWpThemes(adminPage, origin),
+      scanWpCoreAndPhp(adminPage, origin),
+      scanWpUsers(adminPage, origin),
+    ]);
+    const securityPlugins = detectSecurityPlugins(plugins);
+    const phpIsEol = checkPhpEol(coreInfo.phpVersion);
+    const admins = users.filter((u) => /administrator/i.test(u.role));
+
+    statusMsg('🔑', c.brightGreen, `Logged in — WP ${coreInfo.wpVersion || 'unknown'}, PHP ${coreInfo.phpVersion || 'unknown'}, ${plugins.length} plugin(s), ${themes.length} theme(s), ${users.length} user(s).`);
+
+    const outdatedPlugins = plugins.filter((p) => p.updateAvailable);
+    for (const p of outdatedPlugins) addFinding({ category: 'admin-audit', severity: p.active ? 'high' : 'medium', title: `Plugin "${p.name}" has an update available (${p.version || '?'} → ${p.updateToVersion || 'newer'})`, detail: p.active ? 'Active plugin running an outdated version — check the changelog for security fixes.' : 'Inactive but still present on disk; outdated inactive plugins are still a risk if reactivated or directly reachable.', url: `${origin}/wp-admin/plugins.php` });
+    const outdatedThemes = themes.filter((t) => t.updateAvailable);
+    for (const t of outdatedThemes) addFinding({ category: 'admin-audit', severity: t.active ? 'medium' : 'low', title: `Theme "${t.name}" has an update available (${t.version || '?'} → ${t.updateToVersion || 'newer'})`, detail: t.active ? 'Active theme running an outdated version.' : 'Inactive theme, lower priority but still worth updating or removing.', url: `${origin}/wp-admin/themes.php` });
+    if (!securityPlugins.length) addFinding({ category: 'admin-audit', severity: 'medium', title: 'No recognized security plugin is active', detail: 'No active plugin matched known security-plugin signatures (Wordfence, Sucuri, iThemes/SolidWP Security, All In One WP Security, Shield Security, etc.) — consider adding a WAF/hardening plugin.', url: `${origin}/wp-admin/plugins.php` });
+    if (phpIsEol) addFinding({ category: 'admin-audit', severity: 'high', title: `PHP ${coreInfo.phpVersion} is end-of-life`, detail: 'This PHP version no longer receives security patches from php.net — upgrade to a supported version.', url: `${origin}/wp-admin/site-health.php?tab=debug` });
+    if (admins.length > 3) addFinding({ category: 'admin-audit', severity: 'low', title: `${admins.length} users hold the Administrator role`, detail: `Administrators: ${admins.map((u) => u.username).join(', ')}. Review whether all of these need full admin access (principle of least privilege).`, url: `${origin}/wp-admin/users.php` });
+    if (users.some((u) => u.username.toLowerCase() === 'admin')) addFinding({ category: 'admin-audit', severity: 'medium', title: 'A user account is literally named "admin"', detail: 'A username of "admin" is the first guess in any credential-stuffing/brute-force attempt — rename or remove this account.', url: `${origin}/wp-admin/users.php` });
+
+    wpAdminAudit = { coreVersion: coreInfo.wpVersion, phpVersion: coreInfo.phpVersion, phpIsEol, mysqlVersion: coreInfo.mysqlVersion, plugins, themes, users, securityPlugins };
+  } else {
+    statusMsg('⚠', c.brightYellow, 'Form login did not reach wp-admin — check credentials/selectors. Skipping authenticated admin audit.');
+  }
+  await adminPage.close();
+  phaseDone('Authenticated admin audit', Date.now() - adminStart);
+} else if (authSettings.formAuth && primaryPlatform !== 'WordPress') {
+  statusMsg('⏭', c.dim, `Authenticated admin audit is currently WordPress-only; detected platform is "${primaryPlatform}".`);
+}
+
+// ── Phase 12: Payment/donation summary ───────────────────────────────────
 const allPaymentProcessors = new Set();
 let anyCardInputForm = false;
 for (const pr of pageResults) {
@@ -492,10 +684,10 @@ if (allPaymentProcessors.size) {
   addFinding({ category: 'payment', severity: 'info', title: `Payment/donation processor(s) detected: ${[...allPaymentProcessors].join(', ')}`, detail: 'Confirm PCI-DSS scope and that no raw card data touches your own servers.', url: site });
 }
 
-// ── Phase 9: Recon-phase pentest checks ──────────────────────────────────
+// ── Phase 13: Recon-phase pentest checks ──────────────────────────────────
 let reconFindings = [];
 if (!skipRecon) {
-  phaseHeader('Phase 9: Recon-phase checks', '🕵️');
+  phaseHeader('Phase 13: Recon-phase checks', '🕵️');
   const reconStart = Date.now();
 
   const takeovers = await checkSubdomainTakeover(hostname);
@@ -530,8 +722,8 @@ if (!skipRecon) {
   statusMsg('⏭', c.dim, 'Skipping recon-phase checks (--skip-recon).');
 }
 
-// ── Phase 10: Risk scoring + report generation ───────────────────────────
-phaseHeader('Phase 10: Report generation', '📝');
+// ── Phase 14: Risk scoring + report generation ───────────────────────────
+phaseHeader('Phase 14: Report generation', '📝');
 const reportStart = Date.now();
 const sorted = sortFindingsBySeverity(findings);
 const risk = computeRiskGrade(findings);
@@ -546,11 +738,27 @@ if (primaryPlatform === 'WordPress') {
   ]);
 }
 writeCsv(path.join(outDir, 'vulnerabilities.csv'), ['component', 'source', 'id', 'title'], vulnResults.flatMap((r) => r.vulns.map((v) => ({ component: r.component, source: r.source, id: v.id, title: v.title || v.summary || '' }))));
+writeCsv(path.join(outDir, 'port-scan.csv'), ['port', 'name', 'state', 'banner'], portResults);
+if (discoveredSubdomains.length) writeCsv(path.join(outDir, 'subdomains.csv'), ['subdomain'], discoveredSubdomains.map((s) => ({ subdomain: s })));
+if (wpAdminAudit) {
+  writeCsv(path.join(outDir, 'wp-admin-plugins.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion'], wpAdminAudit.plugins);
+  writeCsv(path.join(outDir, 'wp-admin-themes.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion'], wpAdminAudit.themes);
+  writeCsv(path.join(outDir, 'wp-admin-users.csv'), ['username', 'role'], wpAdminAudit.users);
+}
 const generatedAt = new Date().toISOString();
-fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify({
+const summaryData = {
   site, generatedAt, risk, primaryPlatform, platformSignals, hostingSignals, dnsRecords,
   tls: tlsInfo, crawlerExposure, paymentProcessors: [...allPaymentProcessors],
-}, null, 2), 'utf8');
+  whois: whois.checked ? whois : null,
+  subdomains: discoveredSubdomains,
+  openPorts: portResults.filter((r) => r.state === 'open'),
+  wpAdminAudit,
+};
+fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summaryData, null, 2), 'utf8');
+
+const fullReport = { ...summaryData, findings: sorted, vulnerabilities: vulnResults, exposedPaths: pathResults, libraries };
+fs.writeFileSync(path.join(outDir, 'full-report.json'), JSON.stringify(fullReport, null, 2), 'utf8');
+if (jsonOut) console.log(JSON.stringify(fullReport, null, 2));
 
 const dashboardHtml = buildSecurityDashboardHtml({ site, risk, sorted, primaryPlatform, platformSignals, hostingSignals, tlsInfo, dnsRecords, libraries, vulnResults, crawlerExposure, paymentProcessors: [...allPaymentProcessors], generatedAt }, branding);
 fs.writeFileSync(path.join(outDir, 'security-dashboard.html'), dashboardHtml, 'utf8');
@@ -559,29 +767,41 @@ try {
   await reportPage.goto('file://' + path.join(outDir, 'security-dashboard.html'));
   await reportPage.pdf({ path: path.join(outDir, 'security-dashboard.pdf'), format: 'A4', printBackground: true, margin: { top: '20px', bottom: '20px', left: '20px', right: '20px' } });
   await reportPage.close();
-  console.log(`Wrote: ${path.join(outDir, 'security-dashboard.pdf')}`);
+  out(`Wrote: ${path.join(outDir, 'security-dashboard.pdf')}`);
 } catch (e) {
   statusMsg('⚠', c.brightYellow, `PDF generation failed: ${String(e?.message || e)}`);
 }
-console.log(`Wrote: ${path.join(outDir, 'security-dashboard.html')}`);
+out(`Wrote: ${path.join(outDir, 'security-dashboard.html')}`);
 phaseDone('Report generation', Date.now() - reportStart);
 
 await context.close();
 await browser.close();
 
-console.log('');
-console.log(`  ${rainbow('╔══════════════════════════════════════════════════════════╗')}`);
-console.log(`  ${rainbow('║')}  ${c.bold}✨ Security Audit Complete!${c.reset}                          ${rainbow('║')}`);
-console.log(`  ${rainbow('╚══════════════════════════════════════════════════════════╝')}`);
-console.log('');
-console.log(`  🎯 Site           ${site}`);
-console.log(`  🧩 Platform       ${primaryPlatform}`);
-console.log(`  🏆 Risk grade     ${risk.grade} (${risk.score}/100)`);
-console.log(`  🔴 Critical       ${risk.counts.critical}`);
-console.log(`  🟠 High           ${risk.counts.high}`);
-console.log(`  🟡 Medium         ${risk.counts.medium}`);
-console.log(`  🔵 Low            ${risk.counts.low}`);
-console.log(`  ⚪ Info           ${risk.counts.info}`);
-console.log(`  ⏱️  Time           ${formatDuration(Date.now() - auditStart)}`);
-console.log(`  📁 Output         ${outDir}`);
-console.log('');
+out('');
+out(`  ${rainbow('╔══════════════════════════════════════════════════════════╗')}`);
+out(`  ${rainbow('║')}  ${c.bold}✨ Security Audit Complete!${c.reset}                          ${rainbow('║')}`);
+out(`  ${rainbow('╚══════════════════════════════════════════════════════════╝')}`);
+out('');
+out(`  🎯 Site           ${site}`);
+out(`  🧩 Platform       ${primaryPlatform}`);
+out(`  🏆 Risk grade     ${risk.grade} (${risk.score}/100)`);
+out(`  🔴 Critical       ${risk.counts.critical}`);
+out(`  🟠 High           ${risk.counts.high}`);
+out(`  🟡 Medium         ${risk.counts.medium}`);
+out(`  🔵 Low            ${risk.counts.low}`);
+out(`  ⚪ Info           ${risk.counts.info}`);
+out(`  ⏱️  Time           ${formatDuration(Date.now() - auditStart)}`);
+out(`  📁 Output         ${outDir}`);
+out('');
+
+// ── CI/CD gating: exit non-zero if requested severity/grade thresholds are breached ──
+let ciFailed = false;
+if (failOn && hasFindingAtOrAbove(findings, failOn)) {
+  statusMsg('✖', c.brightRed, `--fail-on ${failOn}: at least one finding at or above "${failOn}" severity was found.`);
+  ciFailed = true;
+}
+if (minGrade && isGradeBelow(risk.grade, minGrade)) {
+  statusMsg('✖', c.brightRed, `--min-grade ${minGrade}: risk grade ${risk.grade} is below the required threshold.`);
+  ciFailed = true;
+}
+if (ciFailed) process.exitCode = 1;

@@ -18,7 +18,8 @@
   "dependencies": {
     "chrome-launcher": "^1.1.2",
     "csv-stringify": "^6.6.0",
-    "playwright": "^1.57.0"
+    "playwright": "^1.57.0",
+    "undici": "^8.9.0"
   },
   "engines": {
     "node": ">=20"

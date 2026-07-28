@@ -24,3 +24,21 @@ export function computeRiskGrade(findings = []) {
 export function sortFindingsBySeverity(findings = []) {
   return [...findings].sort((a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity));
 }
+
+// ── CI/CD gating helpers ──
+export const GRADE_ORDER = ['F', 'D', 'C', 'B', 'A', 'A+'];
+
+// True if `grade` is strictly worse than `threshold` (e.g. isGradeBelow('C', 'B') === true).
+export function isGradeBelow(grade, threshold) {
+  const g = GRADE_ORDER.indexOf(String(grade || '').toUpperCase());
+  const t = GRADE_ORDER.indexOf(String(threshold || '').toUpperCase());
+  if (g === -1 || t === -1) return false;
+  return g < t;
+}
+
+// True if any finding is at or above `minSeverity` on the critical>high>medium>low>info scale.
+export function hasFindingAtOrAbove(findings = [], minSeverity) {
+  const idx = SEVERITY_ORDER.indexOf(String(minSeverity || '').toLowerCase());
+  if (idx === -1) return false;
+  return findings.some((f) => SEVERITY_ORDER.indexOf(f.severity) <= idx);
+}

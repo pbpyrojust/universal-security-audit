@@ -1,0 +1,12 @@
+{
+  "loginUrl": "https://www.example.com/wp-login.php",
+  "username": "your-admin-user",
+  "password": "your-admin-password",
+  "usernameSelector": "input[name='log']",
+  "passwordSelector": "input[name='pwd']",
+  "submitSelector": "#wp-submit",
+  "readySelector": "#wpadminbar",
+  "postLoginWaitMs": 2000,
+  "httpUsername": "",
+  "httpPassword": ""
+}

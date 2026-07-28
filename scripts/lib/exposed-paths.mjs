@@ -58,6 +58,17 @@ function isDirectoryListingHtml(html = '') {
   return /index of \//i.test(html) && /<title>index of/i.test(html);
 }
 
+// Loads a user-supplied wordlist file (one path per line, '#' comments and blank lines ignored) and
+// turns it into probe entries alongside the curated lists. Larger lists are gated by --intensity
+// concurrency/delay, same as the built-in path sets.
+export function loadWordlistEntries(fs, filePath) {
+  const text = fs.readFileSync(filePath, 'utf8');
+  return text.split(/\r?\n/g)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map((line) => ({ path: line.startsWith('/') ? line : `/${line}`, label: `Custom wordlist entry: ${line}`, severity: 'medium' }));
+}
+
 export async function probePath(origin, entry, { timeoutMs = 8000, userAgent = 'Universal-Security-Audit' } = {}) {
   const url = new URL(entry.path, origin).toString();
   try {
