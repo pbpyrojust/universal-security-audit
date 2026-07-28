@@ -6,6 +6,9 @@
   "description": "Technical security & attack-surface audit CLI: security header grading, CMS/hosting fingerprinting, exposed-path & admin/API discovery, third-party script + CVE lookups (OSV.dev/WPScan), PII & payment-processor detection, and a risk-graded HTML/PDF report.",
   "scripts": {
     "security-audit": "node scripts/run-security-audit.mjs",
+    "report": "node scripts/generate-security-report.mjs",
+    "tickets": "node scripts/generate-security-tickets.mjs",
+    "compare": "node scripts/compare-security-runs.mjs",
     "cli": "node bin/universal-security-audit.mjs"
   },
   "bin": {

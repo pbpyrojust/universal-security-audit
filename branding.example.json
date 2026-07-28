@@ -1,0 +1,10 @@
+{
+  "companyName": "JustWhat.net",
+  "logo": "./assets/logo.png",
+  "primaryColor": "#ef4444",
+  "secondaryColor": "#0f172a",
+  "accentColor": "#22c55e",
+  "reportTitle": "Security & Attack Surface Audit",
+  "author": "Justin Adams",
+  "footerText": "Confidential — Prepared by JustWhat.net"
+}

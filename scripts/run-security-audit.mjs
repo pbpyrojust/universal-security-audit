@@ -14,6 +14,12 @@ import { npmPackageNameFor, osvLookup, wpscanCoreLookup, wpscanPluginLookup, wps
 import { scanForPii, detectPaymentProcessors } from './lib/pii-payment.mjs';
 import { checkCorsMisconfig, findMixedContent, summarizeCrawlerExposure } from './lib/misc-checks.mjs';
 import { computeRiskGrade, sortFindingsBySeverity } from './lib/scoring.mjs';
+import {
+  checkSubdomainTakeover, checkHttpMethods, checkOpenRedirect, checkMissingSri,
+  checkExposedSourceMaps, checkEmailAuthRecords, enumerateWpAuthors,
+  checkInsecureLoginForms, checkVerboseErrors, scanCookiesForJwt,
+} from './lib/pentest-recon.mjs';
+import { loadBranding, buildSecurityDashboardHtml } from './lib/report-builder.mjs';
 
 // ── CLI / generic helpers ───────────────────────────────────────────────
 function parseArgs(argv) {
@@ -150,7 +156,9 @@ const slowMode = Boolean(args['slow']);
 const respectRobots = Boolean(args['respect-robots']);
 const skipExposedPaths = Boolean(args['skip-exposed-paths']);
 const skipCve = Boolean(args['skip-cve']);
+const skipRecon = Boolean(args['skip-recon']);
 const wpscanApiKey = args['wpscan-key'] || process.env.WPSCAN_API_KEY || '';
+const branding = loadBranding(fs, path, args['brand-config']);
 const outDir = path.resolve('reports/' + runId(site));
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -356,6 +364,9 @@ for (let i = 0; i < pageUrls.length; i++) {
     const pii = scanForPii(html);
     const payments = detectPaymentProcessors(html, inv.scriptUrls);
     const mixed = findMixedContent(html, url);
+    const missingSri = checkMissingSri(html, origin);
+    const insecureLoginForms = checkInsecureLoginForms(html, url);
+    const jwtIssues = scanCookiesForJwt(cookies);
 
     if (pii.secrets.length) {
       for (const s of pii.secrets) addFinding({ category: 'pii', severity: 'critical', title: `Exposed ${s.type} in page source`, detail: `${s.count} occurrence(s), e.g. "${s.sample}"`, url });
@@ -364,6 +375,9 @@ for (let i = 0; i < pageUrls.length; i++) {
     if (pii.cardLike.length) addFinding({ category: 'pii', severity: 'critical', title: 'Credit-card-like number(s) found in page content', detail: `${pii.cardLike.length} Luhn-valid match(es): ${pii.cardLike.slice(0, 3).join(', ')}`, url });
     if (pii.emails.length) addFinding({ category: 'pii', severity: 'info', title: `${pii.emails.length} email address(es) exposed on page`, detail: pii.emails.slice(0, 5).join(', '), url });
     if (mixed.applicable && mixed.refs.length) addFinding({ category: 'mixed-content', severity: 'medium', title: `${mixed.refs.length} mixed-content (http://) resource(s) on HTTPS page`, detail: mixed.refs.slice(0, 5).join(', '), url });
+    if (missingSri.length) addFinding({ category: 'sri', severity: 'low', title: `${missingSri.length} cross-origin script/style tag(s) missing Subresource Integrity`, detail: missingSri.slice(0, 5).join(', '), url });
+    for (const f of insecureLoginForms) addFinding({ category: 'insecure-login-form', severity: 'critical', title: 'Login form submits credentials over plaintext HTTP', detail: `${f.reason} (action: ${f.action})`, url });
+    for (const j of jwtIssues) addFinding({ category: 'jwt', severity: j.alg && String(j.alg).toLowerCase() === 'none' ? 'critical' : 'medium', title: `JWT cookie "${j.cookieName}" has weak claims`, detail: j.issues.join('; '), url });
 
     pageResults.push({ url, platformSignals, pii, payments, mixed });
     statusMsg('✔', c.brightGreen, `[${i + 1}/${pageUrls.length}] ${url}`);
@@ -478,8 +492,46 @@ if (allPaymentProcessors.size) {
   addFinding({ category: 'payment', severity: 'info', title: `Payment/donation processor(s) detected: ${[...allPaymentProcessors].join(', ')}`, detail: 'Confirm PCI-DSS scope and that no raw card data touches your own servers.', url: site });
 }
 
-// ── Phase 9: Risk scoring + report generation ───────────────────────────
-phaseHeader('Phase 9: Report generation', '📝');
+// ── Phase 9: Recon-phase pentest checks ──────────────────────────────────
+let reconFindings = [];
+if (!skipRecon) {
+  phaseHeader('Phase 9: Recon-phase checks', '🕵️');
+  const reconStart = Date.now();
+
+  const takeovers = await checkSubdomainTakeover(hostname);
+  for (const t of takeovers) addFinding({ category: 'subdomain-takeover', severity: 'critical', title: `Possible subdomain takeover: ${t.host}`, detail: t.note, url: `http://${t.host}/` });
+
+  const httpMethods = await checkHttpMethods(site);
+  if (httpMethods.checked && httpMethods.risky.length) addFinding({ category: 'http-methods', severity: 'medium', title: `Risky HTTP method(s) allowed: ${httpMethods.risky.join(', ')}`, detail: `Full Allow list: ${httpMethods.methods.join(', ') || '(none advertised)'}`, url: site });
+
+  const openRedirects = await checkOpenRedirect(origin);
+  for (const r of openRedirects) addFinding({ category: 'open-redirect', severity: 'medium', title: `Open redirect via "${r.param}" parameter`, detail: `Redirects to attacker-controlled URL: ${r.location}`, url: r.testUrl });
+
+  const sourceMaps = await checkExposedSourceMaps(allScriptUrls);
+  if (sourceMaps.length) addFinding({ category: 'source-map', severity: 'low', title: `${sourceMaps.length} exposed source map(s) (.js.map)`, detail: `Source maps can reveal original (unminified) source code. Examples: ${sourceMaps.slice(0, 3).join(', ')}`, url: sourceMaps[0] });
+
+  const emailAuth = await checkEmailAuthRecords(hostname, dnsRecords.txt || []);
+  if (!emailAuth.hasSpf) addFinding({ category: 'email-auth', severity: 'low', title: 'No SPF record found', detail: 'Without SPF, attackers can more easily spoof email "From" addresses on this domain.', url: `dns:${hostname}` });
+  if (!emailAuth.hasDmarc) addFinding({ category: 'email-auth', severity: 'low', title: 'No DMARC record found', detail: 'Without DMARC, spoofed/phishing email using this domain is not rejected or reported.', url: `dns:_dmarc.${hostname}` });
+  else if (emailAuth.dmarcPolicy === 'none') addFinding({ category: 'email-auth', severity: 'info', title: 'DMARC policy is "p=none" (monitor-only)', detail: 'DMARC is present but not enforcing rejection/quarantine of spoofed mail.', url: `dns:_dmarc.${hostname}` });
+
+  if (primaryPlatform === 'WordPress') {
+    const authors = await enumerateWpAuthors(origin);
+    if (authors.length) addFinding({ category: 'user-enum', severity: 'medium', title: `${authors.length} WordPress username(s) enumerable via ?author=N`, detail: authors.map((a) => `id ${a.id} → ${a.username}`).join(', '), url: `${origin}/?author=1` });
+  }
+
+  const verboseErrors = await checkVerboseErrors(origin);
+  if (verboseErrors.checked && verboseErrors.leaksStackTrace) addFinding({ category: 'verbose-errors', severity: 'medium', title: 'Error pages leak stack traces / framework debug info', detail: `Sample: "${verboseErrors.sample.replace(/\s+/g, ' ').slice(0, 200)}"`, url: origin });
+
+  reconFindings = [...takeovers, ...openRedirects, ...sourceMaps];
+  statusMsg('🕵️', c.dim, `Recon checks complete: ${takeovers.length} takeover signal(s), ${openRedirects.length} open redirect(s), ${sourceMaps.length} exposed source map(s).`);
+  phaseDone('Recon-phase checks', Date.now() - reconStart);
+} else {
+  statusMsg('⏭', c.dim, 'Skipping recon-phase checks (--skip-recon).');
+}
+
+// ── Phase 10: Risk scoring + report generation ───────────────────────────
+phaseHeader('Phase 10: Report generation', '📝');
 const reportStart = Date.now();
 const sorted = sortFindingsBySeverity(findings);
 const risk = computeRiskGrade(findings);
@@ -494,12 +546,13 @@ if (primaryPlatform === 'WordPress') {
   ]);
 }
 writeCsv(path.join(outDir, 'vulnerabilities.csv'), ['component', 'source', 'id', 'title'], vulnResults.flatMap((r) => r.vulns.map((v) => ({ component: r.component, source: r.source, id: v.id, title: v.title || v.summary || '' }))));
+const generatedAt = new Date().toISOString();
 fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify({
-  site, generatedAt: new Date().toISOString(), risk, primaryPlatform, hostingSignals, dnsRecords,
+  site, generatedAt, risk, primaryPlatform, platformSignals, hostingSignals, dnsRecords,
   tls: tlsInfo, crawlerExposure, paymentProcessors: [...allPaymentProcessors],
 }, null, 2), 'utf8');
 
-const dashboardHtml = buildDashboardHtml({ site, risk, sorted, primaryPlatform, platformSignals, hostingSignals, tlsInfo, dnsRecords, libraries, vulnResults, crawlerExposure, paymentProcessors: [...allPaymentProcessors] });
+const dashboardHtml = buildSecurityDashboardHtml({ site, risk, sorted, primaryPlatform, platformSignals, hostingSignals, tlsInfo, dnsRecords, libraries, vulnResults, crawlerExposure, paymentProcessors: [...allPaymentProcessors], generatedAt }, branding);
 fs.writeFileSync(path.join(outDir, 'security-dashboard.html'), dashboardHtml, 'utf8');
 try {
   const reportPage = await context.newPage();
@@ -532,77 +585,3 @@ console.log(`  ⚪ Info           ${risk.counts.info}`);
 console.log(`  ⏱️  Time           ${formatDuration(Date.now() - auditStart)}`);
 console.log(`  📁 Output         ${outDir}`);
 console.log('');
-
-// ── Dashboard HTML builder ───────────────────────────────────────────────
-function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])); }
-function buildDashboardHtml({ site, risk, sorted, primaryPlatform, platformSignals, hostingSignals, tlsInfo, dnsRecords, libraries, vulnResults, crawlerExposure, paymentProcessors }) {
-  const gradeColor = { 'A+': '#16a34a', A: '#22c55e', B: '#84cc16', C: '#eab308', D: '#f97316', F: '#ef4444' }[risk.grade] || '#94a3b8';
-  const sevColorMap = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#3b82f6', info: '#94a3b8' };
-  const rows = sorted.map((f) => `
-    <tr>
-      <td><span class="badge" style="background:${sevColorMap[f.severity]}22;color:${sevColorMap[f.severity]}">${esc(f.severity)}</span></td>
-      <td>${esc(f.category)}</td>
-      <td>${esc(f.title)}</td>
-      <td class="detail">${esc(f.detail)}</td>
-      <td class="url">${f.url ? `<a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a>` : ''}</td>
-    </tr>`).join('');
-  const vulnRows = vulnResults.flatMap((r) => r.vulns.map((v) => `
-    <tr><td>${esc(r.component)}</td><td>${esc(r.source)}</td><td>${esc(v.id || '')}</td><td>${esc(v.title || v.summary || '')}</td></tr>`)).join('');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Security Audit — ${esc(site)}</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 2rem; background: #0b0f16; color: #e2e8f0; }
-  h1 { font-size: 1.4rem; margin-bottom: .25rem; }
-  .sub { color: #94a3b8; margin-bottom: 1.5rem; }
-  .grade-card { display: inline-flex; align-items: center; gap: 1rem; background: #131a24; border: 1px solid #1f2937; border-radius: 12px; padding: 1rem 1.5rem; margin-bottom: 1.5rem; }
-  .grade { font-size: 2.5rem; font-weight: 800; color: ${gradeColor}; }
-  .stats { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
-  .stat { background: #131a24; border: 1px solid #1f2937; border-radius: 10px; padding: .75rem 1rem; min-width: 110px; }
-  .stat .n { font-size: 1.4rem; font-weight: 700; }
-  .stat .l { font-size: .75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
-  section { margin-bottom: 2rem; }
-  table { width: 100%; border-collapse: collapse; background: #131a24; border: 1px solid #1f2937; border-radius: 10px; overflow: hidden; }
-  th, td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid #1f2937; font-size: .85rem; vertical-align: top; }
-  th { background: #1a2230; color: #94a3b8; text-transform: uppercase; font-size: .7rem; letter-spacing: .05em; }
-  .badge { padding: .15rem .5rem; border-radius: 999px; font-size: .7rem; font-weight: 700; text-transform: uppercase; }
-  .detail { color: #cbd5e1; max-width: 420px; }
-  .url a { color: #60a5fa; word-break: break-all; }
-  .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 1rem; }
-  .meta-card { background: #131a24; border: 1px solid #1f2937; border-radius: 10px; padding: 1rem; }
-  .meta-card h3 { margin: 0 0 .5rem; font-size: .8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
-  code { background: #1a2230; padding: .1rem .35rem; border-radius: 4px; }
-  @media (prefers-color-scheme: light) {
-    body { background: #f8fafc; color: #0f172a; }
-    .grade-card, .stat, table, .meta-card { background: #fff; border-color: #e2e8f0; }
-    th { background: #f1f5f9; }
-    .detail { color: #334155; }
-  }
-</style></head><body>
-  <h1>🛡️ Universal Security Audit</h1>
-  <div class="sub">${esc(site)} · generated ${new Date().toLocaleString()}</div>
-  <div class="grade-card"><div class="grade">${risk.grade}</div><div><div style="font-weight:600">${risk.score}/100 risk score</div><div style="color:#94a3b8;font-size:.85rem">${risk.total} finding(s) across all checks</div></div></div>
-  <div class="stats">
-    <div class="stat"><div class="n" style="color:${sevColorMap.critical}">${risk.counts.critical}</div><div class="l">Critical</div></div>
-    <div class="stat"><div class="n" style="color:${sevColorMap.high}">${risk.counts.high}</div><div class="l">High</div></div>
-    <div class="stat"><div class="n" style="color:${sevColorMap.medium}">${risk.counts.medium}</div><div class="l">Medium</div></div>
-    <div class="stat"><div class="n" style="color:${sevColorMap.low}">${risk.counts.low}</div><div class="l">Low</div></div>
-    <div class="stat"><div class="n" style="color:${sevColorMap.info}">${risk.counts.info}</div><div class="l">Info</div></div>
-  </div>
-  <section>
-    <div class="meta-grid">
-      <div class="meta-card"><h3>Platform</h3>${platformSignals.map((s) => `<div>${esc(s.platform)} <span style="color:#94a3b8">(${esc(s.confidence)})</span></div>`).join('')}</div>
-      <div class="meta-card"><h3>Hosting / CDN</h3>${hostingSignals.length ? hostingSignals.map((h) => `<div>${esc(h.provider)}</div>`).join('') : '<div style="color:#94a3b8">No signals detected</div>'}</div>
-      <div class="meta-card"><h3>TLS</h3>${tlsInfo.ok ? `<div>${esc(tlsInfo.protocol)}</div><div>Expires in ${tlsInfo.daysRemaining}d</div><div>Issuer: ${esc(tlsInfo.issuer)}</div>` : '<div style="color:#94a3b8">Not checked / unavailable</div>'}</div>
-      <div class="meta-card"><h3>DNS</h3><div>A: ${esc((dnsRecords.a || []).join(', ') || '—')}</div><div>NS: ${esc((dnsRecords.ns || []).join(', ') || '—')}</div><div>MX: ${esc((dnsRecords.mx || []).join(', ') || '—')}</div></div>
-      <div class="meta-card"><h3>Crawler exposure</h3><div>robots.txt: ${crawlerExposure.hasRobots ? 'yes' : 'no'}</div><div>llms.txt: ${crawlerExposure.hasLlmsTxt ? 'yes' : 'no'}</div><div>sitemap: ${crawlerExposure.hasSitemap ? 'yes' : 'no'}</div></div>
-      <div class="meta-card"><h3>Payment/donation</h3>${paymentProcessors.length ? paymentProcessors.map((p) => `<div>${esc(p)}</div>`).join('') : '<div style="color:#94a3b8">None detected</div>'}</div>
-    </div>
-  </section>
-  <section>
-    <h2>Findings</h2>
-    <table><thead><tr><th>Severity</th><th>Category</th><th>Title</th><th>Detail</th><th>URL</th></tr></thead><tbody>${rows || '<tr><td colspan="5" style="text-align:center;color:#94a3b8">No findings 🎉</td></tr>'}</tbody></table>
-  </section>
-  ${vulnRows ? `<section><h2>Known Vulnerabilities (OSV.dev / WPScan)</h2><table><thead><tr><th>Component</th><th>Source</th><th>ID</th><th>Title</th></tr></thead><tbody>${vulnRows}</tbody></table></section>` : ''}
-  <section><h3>Detected libraries</h3><table><thead><tr><th>Name</th><th>Version</th><th>Source</th></tr></thead><tbody>${libraries.map((l) => `<tr><td>${esc(l.name)}</td><td>${esc(l.version || 'unknown')}</td><td class="url">${esc(l.sourceUrl)}</td></tr>`).join('') || '<tr><td colspan="3" style="text-align:center;color:#94a3b8">None detected</td></tr>'}</tbody></table></section>
-</body></html>`;
-}
