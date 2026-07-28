@@ -54,8 +54,8 @@ const afterDir = path.resolve(process.cwd(), args.after);
 const outDir = args['out-dir'] ? path.resolve(process.cwd(), args['out-dir']) : afterDir;
 fs.mkdirSync(outDir, { recursive: true });
 
-const beforeFindings = parseCsv(fs.readFileSync(path.join(beforeDir, 'findings-summary.csv'), 'utf8'));
-const afterFindings = parseCsv(fs.readFileSync(path.join(afterDir, 'findings-summary.csv'), 'utf8'));
+const beforeFindings = parseCsv(fs.readFileSync(path.join(beforeDir, 'findings-summary.csv'), 'utf8')).filter((f) => f.suppressed !== 'true');
+const afterFindings = parseCsv(fs.readFileSync(path.join(afterDir, 'findings-summary.csv'), 'utf8')).filter((f) => f.suppressed !== 'true');
 const key = (r) => `${r.category}__${r.title}__${r.url}`;
 const beforeMap = new Map(beforeFindings.map((r) => [key(r), r]));
 const afterMap = new Map(afterFindings.map((r) => [key(r), r]));

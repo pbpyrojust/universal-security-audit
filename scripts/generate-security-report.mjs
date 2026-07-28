@@ -64,8 +64,8 @@ for (const v of vulnRows) {
   vulnByComponent.get(key).vulns.push({ id: v.id, title: v.title });
 }
 
-const sorted = sortFindingsBySeverity(findingsRows.map((f) => ({ ...f })));
-const risk = summary.risk || computeRiskGrade(findingsRows);
+const sorted = sortFindingsBySeverity(findingsRows.map((f) => ({ ...f, suppressed: f.suppressed === 'true' })));
+const risk = summary.risk || computeRiskGrade(findingsRows.filter((f) => f.suppressed !== 'true'));
 
 const branding = loadBranding(fs, path, args['brand-config']);
 const site = args.site || summary.site;

@@ -30,6 +30,15 @@ import {
   isLoggedIntoWpAdmin, scanWpPlugins, scanWpThemes, scanWpCoreAndPhp, scanWpUsers,
   detectSecurityPlugins, checkPhpEol,
 } from './lib/wp-admin-audit.mjs';
+import { verifyWpAppCredentials, wpRestPlugins, wpRestThemes, wpRestUsers } from './lib/wp-rest-audit.mjs';
+import { lookupLatestPluginVersion, lookupLatestThemeVersion, checkOutdatedAgainstDirectory } from './lib/wp-plugin-directory.mjs';
+import {
+  isLoggedIntoDrupalAdmin, scanDrupalStatusReport, scanDrupalModules, scanDrupalUsers,
+  checkPhpEol as checkDrupalPhpEol, checkDrupalCoreEol,
+} from './lib/drupal-admin-audit.mjs';
+import { enumerateTlsProtocols, getWeakProtocolFindings } from './lib/tls-enum.mjs';
+import { introspectGraphQL } from './lib/graphql-introspect.mjs';
+import { loadBaseline, applyBaseline } from './lib/baseline.mjs';
 
 // ── CLI / generic helpers ───────────────────────────────────────────────
 function parseArgs(argv) {
@@ -232,6 +241,9 @@ const failOn = args['fail-on'] ? String(args['fail-on']).toLowerCase() : '';
 const minGrade = args['min-grade'] ? String(args['min-grade']).toUpperCase() : '';
 const jsonOut = Boolean(args['json']);
 const authSettings = getAuthSettings(args);
+const wpAppUser = args['wp-app-user'] || process.env.USA_WP_APP_USER || '';
+const wpAppPassword = args['wp-app-password'] || process.env.USA_WP_APP_PASSWORD || '';
+const baseline = loadBaseline(fs, path, args['baseline']);
 const outDir = path.resolve('reports/' + runId(site));
 fs.mkdirSync(outDir, { recursive: true });
 
@@ -374,6 +386,15 @@ if (site.startsWith('https:')) {
   } else {
     statusMsg('⚠', c.brightYellow, `TLS check failed: ${tlsInfo.error}`);
   }
+
+  const tlsProtocolResults = await enumerateTlsProtocols(hostname);
+  const weakProtocolsAccepted = getWeakProtocolFindings(tlsProtocolResults);
+  if (weakProtocolsAccepted.length) {
+    statusMsg('🔓', c.brightRed, `Server still accepts legacy TLS: ${weakProtocolsAccepted.map((p) => p.protocol).join(', ')}`);
+    addFinding({ category: 'tls', severity: 'high', title: `Legacy TLS protocol(s) still accepted: ${weakProtocolsAccepted.map((p) => p.protocol).join(', ')}`, detail: 'Confirmed by directly handshaking with each protocol version — not just reporting the default negotiated one. Legacy TLS lacks modern cipher/MAC protections and should be disabled server-side.', url: site });
+  } else {
+    statusMsg('🔒', c.dim, 'Legacy TLS 1.0/1.1 correctly rejected by the server.');
+  }
 }
 
 const corsResult = await checkCorsMisconfig(site);
@@ -486,6 +507,21 @@ if (!skipExposedPaths) {
     });
   }
   statusMsg('🔎', exposed.length ? c.brightYellow : c.brightGreen, `${exposed.length}/${pathResults.length} probed path(s) responded publicly.`);
+
+  const graphqlPath = exposed.find((r) => r.path === '/graphql');
+  if (graphqlPath) {
+    const introspection = await introspectGraphQL(graphqlPath.url);
+    if (introspection.checked && introspection.introspectionEnabled) {
+      statusMsg('🔮', c.brightYellow, `GraphQL introspection is enabled — schema (${introspection.typeCount} types${introspection.hasMutations ? ', mutations present' : ''}) is fully readable.`);
+      addFinding({
+        category: 'graphql',
+        severity: introspection.sensitiveMutations.length ? 'high' : 'medium',
+        title: 'GraphQL introspection is enabled',
+        detail: `${introspection.typeCount} type(s) exposed.${introspection.hasMutations ? ` Mutations: ${introspection.mutationFieldNames.slice(0, 10).join(', ')}.` : ' No mutations exposed.'}${introspection.sensitiveMutations.length ? ` Sensitive-sounding mutations: ${introspection.sensitiveMutations.join(', ')}.` : ''} Introspection should generally be disabled in production.`,
+        url: graphqlPath.url,
+      });
+    }
+  }
   phaseDone('Exposed path discovery', Date.now() - pathStart);
 } else {
   statusMsg('⏭', c.dim, 'Skipping exposed-path discovery (--skip-exposed-paths).');
@@ -631,43 +667,112 @@ if (!skipCve) {
   statusMsg('⏭', c.dim, 'Skipping CVE lookups (--skip-cve).');
 }
 
-// ── Phase 11: Authenticated admin audit (WordPress wp-admin, when credentials are supplied) ──
+// ── Phase 11: Authenticated admin audit (WordPress or Drupal, when credentials are supplied) ──
 let wpAdminAudit = null;
-if (!skipAdminAudit && primaryPlatform === 'WordPress' && authSettings.formAuth) {
+let drupalAdminAudit = null;
+const hasAnyAuth = authSettings.formAuth || (wpAppUser && wpAppPassword);
+if (!skipAdminAudit && hasAnyAuth && (primaryPlatform === 'WordPress' || primaryPlatform === 'Drupal')) {
   phaseHeader('Phase 11: Authenticated admin audit', '🔑');
   const adminStart = Date.now();
-  const adminPage = await context.newPage();
-  const loggedIn = await maybePerformFormLogin(adminPage, authSettings.formAuth, slowMode);
-  if (loggedIn && await isLoggedIntoWpAdmin(adminPage, origin)) {
-    const [plugins, themes, coreInfo, users] = await Promise.all([
-      scanWpPlugins(adminPage, origin),
-      scanWpThemes(adminPage, origin),
-      scanWpCoreAndPhp(adminPage, origin),
-      scanWpUsers(adminPage, origin),
-    ]);
-    const securityPlugins = detectSecurityPlugins(plugins);
-    const phpIsEol = checkPhpEol(coreInfo.phpVersion);
-    const admins = users.filter((u) => /administrator/i.test(u.role));
 
-    statusMsg('🔑', c.brightGreen, `Logged in — WP ${coreInfo.wpVersion || 'unknown'}, PHP ${coreInfo.phpVersion || 'unknown'}, ${plugins.length} plugin(s), ${themes.length} theme(s), ${users.length} user(s).`);
+  if (primaryPlatform === 'WordPress' && wpAppUser && wpAppPassword) {
+    // Preferred path: WP Application Passwords via the REST API — no Playwright login needed,
+    // stable across admin-theme/UI changes, and scoped to whatever the account can already do.
+    const verify = await verifyWpAppCredentials(origin, wpAppUser, wpAppPassword);
+    if (verify.ok) {
+      const [pluginsRes, themesRes, usersRes] = await Promise.all([
+        wpRestPlugins(origin, wpAppUser, wpAppPassword),
+        wpRestThemes(origin, wpAppUser, wpAppPassword),
+        wpRestUsers(origin, wpAppUser, wpAppPassword),
+      ]);
+      const plugins = pluginsRes.ok ? pluginsRes.plugins : [];
+      const themes = themesRes.ok ? themesRes.themes : [];
+      const users = usersRes.ok ? usersRes.users : [];
+      const [pluginVersionChecks, themeVersionChecks] = await Promise.all([
+        checkOutdatedAgainstDirectory(plugins, lookupLatestPluginVersion),
+        checkOutdatedAgainstDirectory(themes, lookupLatestThemeVersion),
+      ]);
+      const securityPlugins = detectSecurityPlugins(plugins);
+      const admins = users.filter((u) => /administrator/i.test(u.role));
 
-    const outdatedPlugins = plugins.filter((p) => p.updateAvailable);
-    for (const p of outdatedPlugins) addFinding({ category: 'admin-audit', severity: p.active ? 'high' : 'medium', title: `Plugin "${p.name}" has an update available (${p.version || '?'} → ${p.updateToVersion || 'newer'})`, detail: p.active ? 'Active plugin running an outdated version — check the changelog for security fixes.' : 'Inactive but still present on disk; outdated inactive plugins are still a risk if reactivated or directly reachable.', url: `${origin}/wp-admin/plugins.php` });
-    const outdatedThemes = themes.filter((t) => t.updateAvailable);
-    for (const t of outdatedThemes) addFinding({ category: 'admin-audit', severity: t.active ? 'medium' : 'low', title: `Theme "${t.name}" has an update available (${t.version || '?'} → ${t.updateToVersion || 'newer'})`, detail: t.active ? 'Active theme running an outdated version.' : 'Inactive theme, lower priority but still worth updating or removing.', url: `${origin}/wp-admin/themes.php` });
-    if (!securityPlugins.length) addFinding({ category: 'admin-audit', severity: 'medium', title: 'No recognized security plugin is active', detail: 'No active plugin matched known security-plugin signatures (Wordfence, Sucuri, iThemes/SolidWP Security, All In One WP Security, Shield Security, etc.) — consider adding a WAF/hardening plugin.', url: `${origin}/wp-admin/plugins.php` });
-    if (phpIsEol) addFinding({ category: 'admin-audit', severity: 'high', title: `PHP ${coreInfo.phpVersion} is end-of-life`, detail: 'This PHP version no longer receives security patches from php.net — upgrade to a supported version.', url: `${origin}/wp-admin/site-health.php?tab=debug` });
-    if (admins.length > 3) addFinding({ category: 'admin-audit', severity: 'low', title: `${admins.length} users hold the Administrator role`, detail: `Administrators: ${admins.map((u) => u.username).join(', ')}. Review whether all of these need full admin access (principle of least privilege).`, url: `${origin}/wp-admin/users.php` });
-    if (users.some((u) => u.username.toLowerCase() === 'admin')) addFinding({ category: 'admin-audit', severity: 'medium', title: 'A user account is literally named "admin"', detail: 'A username of "admin" is the first guess in any credential-stuffing/brute-force attempt — rename or remove this account.', url: `${origin}/wp-admin/users.php` });
+      statusMsg('🔑', c.brightGreen, `Authenticated via Application Password — ${plugins.length} plugin(s), ${themes.length} theme(s), ${users.length} user(s) (via REST API).`);
 
-    wpAdminAudit = { coreVersion: coreInfo.wpVersion, phpVersion: coreInfo.phpVersion, phpIsEol, mysqlVersion: coreInfo.mysqlVersion, plugins, themes, users, securityPlugins };
-  } else {
-    statusMsg('⚠', c.brightYellow, 'Form login did not reach wp-admin — check credentials/selectors. Skipping authenticated admin audit.');
+      const outdatedPlugins = pluginVersionChecks.filter((p) => p.outdated);
+      for (const p of outdatedPlugins) addFinding({ category: 'admin-audit', severity: p.active ? 'high' : 'medium', title: `Plugin "${p.name}" is outdated (${p.version} installed, ${p.latestVersion} available)`, detail: p.active ? 'Active plugin behind the latest wordpress.org release — check the changelog for security fixes.' : 'Inactive but still present on disk; outdated inactive plugins are still a risk if reactivated or directly reachable.', url: `${origin}/wp-admin/plugins.php` });
+      const outdatedThemes = themeVersionChecks.filter((t) => t.outdated);
+      for (const t of outdatedThemes) addFinding({ category: 'admin-audit', severity: t.active ? 'medium' : 'low', title: `Theme "${t.name}" is outdated (${t.version} installed, ${t.latestVersion} available)`, detail: t.active ? 'Active theme behind the latest wordpress.org release.' : 'Inactive theme, lower priority but still worth updating or removing.', url: `${origin}/wp-admin/themes.php` });
+      if (!securityPlugins.length) addFinding({ category: 'admin-audit', severity: 'medium', title: 'No recognized security plugin is active', detail: 'No active plugin matched known security-plugin signatures (Wordfence, Sucuri, iThemes/SolidWP Security, All In One WP Security, Shield Security, etc.) — consider adding a WAF/hardening plugin.', url: `${origin}/wp-admin/plugins.php` });
+      if (admins.length > 3) addFinding({ category: 'admin-audit', severity: 'low', title: `${admins.length} users hold the Administrator role`, detail: `Administrators: ${admins.map((u) => u.username).join(', ')}. Review whether all of these need full admin access (principle of least privilege).`, url: `${origin}/wp-admin/users.php` });
+      if (users.some((u) => u.username.toLowerCase() === 'admin')) addFinding({ category: 'admin-audit', severity: 'medium', title: 'A user account is literally named "admin"', detail: 'A username of "admin" is the first guess in any credential-stuffing/brute-force attempt — rename or remove this account.', url: `${origin}/wp-admin/users.php` });
+
+      wpAdminAudit = { authMethod: 'rest-api', plugins: pluginVersionChecks, themes: themeVersionChecks, users, securityPlugins };
+    } else {
+      statusMsg('⚠', c.brightYellow, `WP Application Password verification failed: ${verify.error || 'unknown error'}. Skipping authenticated admin audit.`);
+    }
+  } else if (primaryPlatform === 'WordPress' && authSettings.formAuth) {
+    // Fallback: form login + wp-admin HTML scraping, for sites where an Application Password
+    // hasn't been created.
+    const adminPage = await context.newPage();
+    const loggedIn = await maybePerformFormLogin(adminPage, authSettings.formAuth, slowMode);
+    if (loggedIn && await isLoggedIntoWpAdmin(adminPage, origin)) {
+      const [plugins, themes, coreInfo, users] = await Promise.all([
+        scanWpPlugins(adminPage, origin),
+        scanWpThemes(adminPage, origin),
+        scanWpCoreAndPhp(adminPage, origin),
+        scanWpUsers(adminPage, origin),
+      ]);
+      const securityPlugins = detectSecurityPlugins(plugins);
+      const phpIsEol = checkPhpEol(coreInfo.phpVersion);
+      const admins = users.filter((u) => /administrator/i.test(u.role));
+
+      statusMsg('🔑', c.brightGreen, `Logged in — WP ${coreInfo.wpVersion || 'unknown'}, PHP ${coreInfo.phpVersion || 'unknown'}, ${plugins.length} plugin(s), ${themes.length} theme(s), ${users.length} user(s).`);
+
+      const outdatedPlugins = plugins.filter((p) => p.updateAvailable);
+      for (const p of outdatedPlugins) addFinding({ category: 'admin-audit', severity: p.active ? 'high' : 'medium', title: `Plugin "${p.name}" has an update available (${p.version || '?'} → ${p.updateToVersion || 'newer'})`, detail: p.active ? 'Active plugin running an outdated version — check the changelog for security fixes.' : 'Inactive but still present on disk; outdated inactive plugins are still a risk if reactivated or directly reachable.', url: `${origin}/wp-admin/plugins.php` });
+      const outdatedThemes = themes.filter((t) => t.updateAvailable);
+      for (const t of outdatedThemes) addFinding({ category: 'admin-audit', severity: t.active ? 'medium' : 'low', title: `Theme "${t.name}" has an update available (${t.version || '?'} → ${t.updateToVersion || 'newer'})`, detail: t.active ? 'Active theme running an outdated version.' : 'Inactive theme, lower priority but still worth updating or removing.', url: `${origin}/wp-admin/themes.php` });
+      if (!securityPlugins.length) addFinding({ category: 'admin-audit', severity: 'medium', title: 'No recognized security plugin is active', detail: 'No active plugin matched known security-plugin signatures (Wordfence, Sucuri, iThemes/SolidWP Security, All In One WP Security, Shield Security, etc.) — consider adding a WAF/hardening plugin.', url: `${origin}/wp-admin/plugins.php` });
+      if (phpIsEol) addFinding({ category: 'admin-audit', severity: 'high', title: `PHP ${coreInfo.phpVersion} is end-of-life`, detail: 'This PHP version no longer receives security patches from php.net — upgrade to a supported version.', url: `${origin}/wp-admin/site-health.php?tab=debug` });
+      if (admins.length > 3) addFinding({ category: 'admin-audit', severity: 'low', title: `${admins.length} users hold the Administrator role`, detail: `Administrators: ${admins.map((u) => u.username).join(', ')}. Review whether all of these need full admin access (principle of least privilege).`, url: `${origin}/wp-admin/users.php` });
+      if (users.some((u) => u.username.toLowerCase() === 'admin')) addFinding({ category: 'admin-audit', severity: 'medium', title: 'A user account is literally named "admin"', detail: 'A username of "admin" is the first guess in any credential-stuffing/brute-force attempt — rename or remove this account.', url: `${origin}/wp-admin/users.php` });
+
+      wpAdminAudit = { authMethod: 'form-login', coreVersion: coreInfo.wpVersion, phpVersion: coreInfo.phpVersion, phpIsEol, mysqlVersion: coreInfo.mysqlVersion, plugins, themes, users, securityPlugins };
+    } else {
+      statusMsg('⚠', c.brightYellow, 'Form login did not reach wp-admin — check credentials/selectors. Skipping authenticated admin audit.');
+    }
+    await adminPage.close();
+  } else if (primaryPlatform === 'Drupal' && authSettings.formAuth) {
+    const adminPage = await context.newPage();
+    const loggedIn = await maybePerformFormLogin(adminPage, authSettings.formAuth, slowMode);
+    if (loggedIn && await isLoggedIntoDrupalAdmin(adminPage, origin)) {
+      const [statusReport, modules, users] = await Promise.all([
+        scanDrupalStatusReport(adminPage, origin),
+        scanDrupalModules(adminPage, origin),
+        scanDrupalUsers(adminPage, origin),
+      ]);
+      const phpIsEol = checkDrupalPhpEol(statusReport.phpVersion);
+      const coreIsEol = checkDrupalCoreEol(statusReport.drupalVersion);
+      const admins = users.filter((u) => /administrator/i.test(u.roles));
+      const enabledModuleCount = modules.filter((m) => m.enabled).length;
+
+      statusMsg('🔑', c.brightGreen, `Logged in — Drupal ${statusReport.drupalVersion || 'unknown'}, PHP ${statusReport.phpVersion || 'unknown'}, ${enabledModuleCount} enabled module(s), ${users.length} user(s).`);
+
+      if (statusReport.errorCount > 0) addFinding({ category: 'admin-audit', severity: 'high', title: `${statusReport.errorCount} error-level item(s) on the Drupal status report`, detail: statusReport.errorItems.slice(0, 5).join(' | ') || 'See /admin/reports/status for details.', url: `${origin}/admin/reports/status` });
+      if (statusReport.warningCount > 0) addFinding({ category: 'admin-audit', severity: 'medium', title: `${statusReport.warningCount} warning-level item(s) on the Drupal status report`, detail: 'See /admin/reports/status for details.', url: `${origin}/admin/reports/status` });
+      if (phpIsEol) addFinding({ category: 'admin-audit', severity: 'high', title: `PHP ${statusReport.phpVersion} is end-of-life`, detail: 'This PHP version no longer receives security patches from php.net — upgrade to a supported version.', url: `${origin}/admin/reports/status` });
+      if (coreIsEol) addFinding({ category: 'admin-audit', severity: 'critical', title: `Drupal ${statusReport.drupalVersion} core is end-of-life`, detail: 'This major Drupal version no longer receives security releases — upgrade is overdue.', url: `${origin}/admin/reports/status` });
+      if (admins.length > 3) addFinding({ category: 'admin-audit', severity: 'low', title: `${admins.length} users hold an Administrator role`, detail: `Review whether all of these need full admin access (principle of least privilege).`, url: `${origin}/admin/people` });
+      if (users.some((u) => u.username.toLowerCase() === 'admin')) addFinding({ category: 'admin-audit', severity: 'medium', title: 'A user account is literally named "admin"', detail: 'A username of "admin" is the first guess in any credential-stuffing/brute-force attempt — rename or remove this account.', url: `${origin}/admin/people` });
+
+      drupalAdminAudit = { coreVersion: statusReport.drupalVersion, phpVersion: statusReport.phpVersion, phpIsEol, coreIsEol, dbVersion: statusReport.dbVersion, modules, users };
+    } else {
+      statusMsg('⚠', c.brightYellow, 'Form login did not reach the Drupal admin area — check credentials/selectors. Skipping authenticated admin audit.');
+    }
+    await adminPage.close();
   }
-  await adminPage.close();
   phaseDone('Authenticated admin audit', Date.now() - adminStart);
-} else if (authSettings.formAuth && primaryPlatform !== 'WordPress') {
-  statusMsg('⏭', c.dim, `Authenticated admin audit is currently WordPress-only; detected platform is "${primaryPlatform}".`);
+} else if (hasAnyAuth && primaryPlatform !== 'WordPress' && primaryPlatform !== 'Drupal') {
+  statusMsg('⏭', c.dim, `Authenticated admin audit currently supports WordPress and Drupal only; detected platform is "${primaryPlatform}".`);
 }
 
 // ── Phase 12: Payment/donation summary ───────────────────────────────────
@@ -725,10 +830,14 @@ if (!skipRecon) {
 // ── Phase 14: Risk scoring + report generation ───────────────────────────
 phaseHeader('Phase 14: Report generation', '📝');
 const reportStart = Date.now();
-const sorted = sortFindingsBySeverity(findings);
-const risk = computeRiskGrade(findings);
+const sortedRaw = sortFindingsBySeverity(findings);
+const sorted = applyBaseline(sortedRaw, baseline);
+const activeFindings = sorted.filter((f) => !f.suppressed);
+const suppressedCount = sorted.length - activeFindings.length;
+if (suppressedCount) statusMsg('🗂️', c.dim, `${suppressedCount} finding(s) suppressed by --baseline.`);
+const risk = computeRiskGrade(activeFindings);
 
-writeCsv(path.join(outDir, 'findings-summary.csv'), ['category', 'severity', 'title', 'detail', 'url'], sorted);
+writeCsv(path.join(outDir, 'findings-summary.csv'), ['category', 'severity', 'title', 'detail', 'url', 'suppressed', 'suppressedReason'], sorted);
 writeCsv(path.join(outDir, 'exposed-paths.csv'), ['path', 'label', 'status', 'exists', 'directoryListing', 'severity', 'url'], pathResults);
 writeCsv(path.join(outDir, 'script-inventory.csv'), ['name', 'version', 'sourceUrl'], libraries);
 if (primaryPlatform === 'WordPress') {
@@ -741,9 +850,13 @@ writeCsv(path.join(outDir, 'vulnerabilities.csv'), ['component', 'source', 'id',
 writeCsv(path.join(outDir, 'port-scan.csv'), ['port', 'name', 'state', 'banner'], portResults);
 if (discoveredSubdomains.length) writeCsv(path.join(outDir, 'subdomains.csv'), ['subdomain'], discoveredSubdomains.map((s) => ({ subdomain: s })));
 if (wpAdminAudit) {
-  writeCsv(path.join(outDir, 'wp-admin-plugins.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion'], wpAdminAudit.plugins);
-  writeCsv(path.join(outDir, 'wp-admin-themes.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion'], wpAdminAudit.themes);
+  writeCsv(path.join(outDir, 'wp-admin-plugins.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion', 'latestVersion', 'outdated'], wpAdminAudit.plugins);
+  writeCsv(path.join(outDir, 'wp-admin-themes.csv'), ['slug', 'name', 'active', 'version', 'updateAvailable', 'updateToVersion', 'latestVersion', 'outdated'], wpAdminAudit.themes);
   writeCsv(path.join(outDir, 'wp-admin-users.csv'), ['username', 'role'], wpAdminAudit.users);
+}
+if (drupalAdminAudit) {
+  writeCsv(path.join(outDir, 'drupal-admin-modules.csv'), ['slug', 'name', 'enabled', 'version'], drupalAdminAudit.modules);
+  writeCsv(path.join(outDir, 'drupal-admin-users.csv'), ['username', 'roles', 'status'], drupalAdminAudit.users);
 }
 const generatedAt = new Date().toISOString();
 const summaryData = {
@@ -753,6 +866,8 @@ const summaryData = {
   subdomains: discoveredSubdomains,
   openPorts: portResults.filter((r) => r.state === 'open'),
   wpAdminAudit,
+  drupalAdminAudit,
+  suppressedFindingsCount: suppressedCount,
 };
 fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summaryData, null, 2), 'utf8');
 
@@ -796,7 +911,7 @@ out('');
 
 // ── CI/CD gating: exit non-zero if requested severity/grade thresholds are breached ──
 let ciFailed = false;
-if (failOn && hasFindingAtOrAbove(findings, failOn)) {
+if (failOn && hasFindingAtOrAbove(activeFindings, failOn)) {
   statusMsg('✖', c.brightRed, `--fail-on ${failOn}: at least one finding at or above "${failOn}" severity was found.`);
   ciFailed = true;
 }

@@ -35,8 +35,8 @@ export function buildSecurityDashboardHtml({
   const gradeColor = { 'A+': '#16a34a', A: '#22c55e', B: '#84cc16', C: '#eab308', D: '#f97316', F: '#ef4444' }[risk.grade] || '#94a3b8';
   const sevColorMap = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#3b82f6', info: '#94a3b8' };
   const rows = sorted.map((f) => `
-    <tr>
-      <td><span class="badge" style="background:${sevColorMap[f.severity]}22;color:${sevColorMap[f.severity]}">${esc(f.severity)}</span></td>
+    <tr${f.suppressed ? ' style="opacity:.5"' : ''}>
+      <td><span class="badge" style="background:${sevColorMap[f.severity]}22;color:${sevColorMap[f.severity]}">${esc(f.severity)}</span>${f.suppressed ? ' <span class="badge" style="background:#64748b22;color:#64748b" title="' + esc(f.suppressedReason || '') + '">suppressed</span>' : ''}</td>
       <td>${esc(f.category)}</td>
       <td>${esc(f.title)}</td>
       <td class="detail">${esc(f.detail)}</td>

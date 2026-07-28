@@ -9,6 +9,9 @@
     "report": "node scripts/generate-security-report.mjs",
     "tickets": "node scripts/generate-security-tickets.mjs",
     "compare": "node scripts/compare-security-runs.mjs",
+    "sarif": "node scripts/generate-security-sarif.mjs",
+    "baseline": "node scripts/generate-baseline.mjs",
+    "batch-audit": "node scripts/run-batch-audit.mjs",
     "cli": "node bin/universal-security-audit.mjs"
   },
   "bin": {
@@ -46,6 +49,11 @@
     "wpscan",
     "cli",
     "audit",
-    "playwright"
+    "playwright",
+    "graphql",
+    "sarif",
+    "drupal",
+    "tls",
+    "port-scan"
   ]
 }

@@ -57,7 +57,7 @@ const SEVERITY_PRIORITY = { critical: 'P0', high: 'P1', medium: 'P2', low: 'P3',
 const args = parseArgs(process.argv);
 const runDir = args['run-dir'];
 if (!runDir) { console.error('ERROR: Missing --run-dir'); process.exit(1); }
-const findings = parseCsv(fs.readFileSync(path.join(runDir, 'findings-summary.csv'), 'utf8'));
+const findings = parseCsv(fs.readFileSync(path.join(runDir, 'findings-summary.csv'), 'utf8')).filter((f) => f.suppressed !== 'true');
 
 const globals = new Map();
 const perUrl = [];
