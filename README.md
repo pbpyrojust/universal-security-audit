@@ -212,7 +212,7 @@ Writes `security-ticket-backlog.csv`: one ticket per site-wide issue (headers, T
 node scripts/compare-security-runs.mjs --before reports/run-a --after reports/run-b
 ```
 
-Writes `security-compare-summary.csv` (severity counts before/after/delta), `security-compare-new-findings.csv`, `security-compare-resolved-findings.csv`, and a human-readable `security-compare-summary.md` — including the risk-grade delta. Use this after remediation work to confirm fixes landed and nothing regressed.
+Writes `security-compare-summary.csv` (severity counts before/after/delta), `security-compare-new-findings.csv`, `security-compare-resolved-findings.csv`, and a human-readable `security-compare-summary.md` — including the risk-grade delta. Add `--out-dir <path>` to write these somewhere other than the "after" run's own directory (the default). Use this after remediation work to confirm fixes landed and nothing regressed.
 
 ### SARIF export (GitHub code scanning)
 
@@ -234,15 +234,15 @@ node scripts/generate-baseline.mjs --run-dir reports/<run-folder> --out ./securi
 node scripts/run-security-audit.mjs --site https://www.example.com --baseline ./security-baseline.json
 ```
 
-Suppression is keyed on a stable fingerprint of `category + title + url`, so a finding stays suppressed as long as it's the same issue at the same location. Suppressed findings still appear in `findings-summary.csv` and the dashboard (dimmed, with the acceptance reason), they just don't count toward the risk grade or trip `--fail-on`/`--min-grade`. Add an `"expires"` date (ISO format) to any baseline entry to make the exception temporary — after that date it stops applying automatically.
+Suppression is keyed on a stable fingerprint of `category + title + url`, so a finding stays suppressed as long as it's the same issue at the same location. Suppressed findings still appear in `findings-summary.csv` and the dashboard (dimmed, with the acceptance reason), they just don't count toward the risk grade or trip `--fail-on`/`--min-grade`. Add an `"expires"` date (ISO format) to any baseline entry to make the exception temporary — after that date it stops applying automatically. `generate-baseline.mjs` flags: `--out <path>` (default `./security-baseline.json`), `--reason <text>`, `--expires <ISO date>`, `--overwrite` (replace the file instead of merging new exceptions into it).
 
 ### Multi-site batch scanning
 
 ```bash
-node scripts/run-batch-audit.mjs --sites-file ./sites.txt --intensity light --skip-cve
+node scripts/run-batch-audit.mjs --sites-file ./sites.txt --intensity light --skip-cve --concurrency 2 --out-dir ./reports
 ```
 
-`sites.txt` is one URL per line (`#` comments allowed). Runs the full audit against each site (sequential by default; `--concurrency N` for parallel — keep this low, each run launches its own browser), forwarding every other flag through to each individual audit. Every site still gets its normal `reports/<site>-<timestamp>/` output, plus an aggregated `batch-summary-<id>.csv`/`.md` in the reports root with one row per site (grade, score, severity counts) sorted worst-first — useful for agencies auditing a portfolio of client sites in one pass.
+`sites.txt` is one URL per line (`#` comments allowed). Runs the full audit against each site (`--concurrency N`, default 1/sequential — keep this low, each run launches its own browser), forwarding every other flag through to each individual audit. Every site still gets its normal `reports/<site>-<timestamp>/` output, plus an aggregated `batch-summary-<id>.csv`/`.md` (`--out-dir` controls where, default `./reports`) with one row per site (grade, score, severity counts) sorted worst-first — useful for agencies auditing a portfolio of client sites in one pass.
 
 ### CLI wrapper
 
@@ -257,6 +257,103 @@ node bin/universal-security-audit.mjs sarif --run-dir reports/<run-folder> --out
 node bin/universal-security-audit.mjs baseline --run-dir reports/<run-folder> --out ./security-baseline.json
 node bin/universal-security-audit.mjs batch-audit --sites-file ./sites.txt
 node bin/universal-security-audit.mjs help
+```
+
+## Example workflows by site type / use case
+
+### Quick first-pass on a live WordPress site
+
+Default posture — fast, unauthenticated, safe to run against a client's live production site without asking anyone first (still get permission):
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com --intensity light
+```
+
+### Full authenticated WordPress security review
+
+Agency-style deep audit: create an Application Password in the client's wp-admin first (Users → Profile → Application Passwords), get a free [WPScan API key](https://wpscan.com/api), then:
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com \
+  --wp-app-user admin --wp-app-password "xxxx xxxx xxxx xxxx xxxx xxxx" \
+  --wpscan-key YOUR_WPSCAN_KEY --crawl --max-pages 50
+node bin/universal-security-audit.mjs tickets --run-dir ./reports/<run-id>
+```
+
+Gives you plugin/theme CVEs, outdated inactive plugins nobody remembers installing, missing security plugins, and a ticket-ready backlog in one pass.
+
+### Drupal site
+
+Same shape, form-login only (no Application Passwords in Drupal core):
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com \
+  --login-url https://www.example.com/user/login --username admin --password your-password
+```
+
+### E-commerce / donation site
+
+Payment-processor and PCI-scope questions matter most here; a full run already covers this, but it's worth calling out what to look at in the output — the `payment` category in `findings-summary.csv` and the "Payment/donation" card on the dashboard:
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com
+```
+
+Look for: a card-input form without a recognized tokenizing processor (Stripe/Square/Braintree/Authorize.Net) flagged `high`, missing HSTS/CSP on checkout pages, and mixed-content resources on any page that touches payment.
+
+### Staging / password-protected site (HTTP Basic Auth)
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://staging.example.com \
+  --http-username staging-user --http-password staging-pass --respect-robots
+```
+
+### CI/CD gate on every deploy (GitHub Actions)
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com \
+  --intensity light --skip-port-scan --skip-subdomain-enum \
+  --baseline ./security-baseline.json --fail-on high --json > report.json
+node bin/universal-security-audit.mjs sarif --run-dir "$(ls -td reports/*/ | head -1)" --out results.sarif
+```
+
+Then upload `results.sarif` with `github/codeql-action/upload-sarif` so findings show up in the repo's Security tab. `--fail-on high` fails the build on anything high/critical that isn't already in the baseline; port scan/subdomain enum are skipped here since they're slower and less relevant to "did this deploy regress anything."
+
+### Agency portfolio — many client sites on a schedule
+
+```bash
+node bin/universal-security-audit.mjs batch-audit --sites-file ./client-sites.txt \
+  --intensity light --skip-cve --concurrency 2
+```
+
+Pair with a cron/scheduled job and diff each site's `summary.json` week over week (or use `compare` against the prior run per site) to catch regressions before a client notices.
+
+### Custom app / SPA / non-CMS site (Next.js, headless, etc.)
+
+Platform fingerprinting won't find a CMS to fingerprint here, so CVE/plugin-version checks won't have much to do — the value comes from headers, TLS, CORS, exposed paths, port scan, and PII/secret scanning instead:
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://app.example.com --skip-cve
+```
+
+### Confirm remediation actually worked
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com --intensity light   # after fixes
+node bin/universal-security-audit.mjs compare --before ./reports/<before-run> --after ./reports/<after-run>
+```
+
+Check `security-compare-summary.md` for the risk-grade delta and confirm the specific findings you fixed show up under "Resolved findings," not "New findings" (which would mean something regressed elsewhere).
+
+### One-time deep pentest-style engagement
+
+Maximum coverage, routed through Burp Suite so a human can inspect/replay anything interesting:
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com \
+  --intensity aggressive --crawl --max-pages 100 \
+  --wordlist ./my-wordlist.txt --proxy http://127.0.0.1:8080 \
+  --wp-app-user admin --wp-app-password "xxxx xxxx xxxx xxxx xxxx xxxx" --wpscan-key YOUR_KEY
 ```
 
 ## Risk grading
