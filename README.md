@@ -104,6 +104,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | `--max-pages <n>` | Max pages to scan. Omit it and there's no limit — sitemap discovery pulls every URL it finds, and `--crawl` follows links until it exhausts the site; pass a number to cap either one on large sites |
 | `--crawl` | Discover pages by following internal links instead of using the sitemap |
 | `--max-per-url-pattern <n>` | Crawl-trap guard (default 3): caps how many pages matching the same URL "shape" get crawled — path segments that look like IDs/hashes/years (`/participants/mypage/1174017/2026`) are collapsed to a placeholder (`/participants/mypage/:id/:id`) for this comparison, so a site with thousands of per-record pages (fundraiser pages, product pages, forum threads) doesn't turn an uncapped `--crawl` into tens of thousands of near-duplicate requests |
+| `--max-depth <n>` | How many link "hops" from the homepage `--crawl` follows: `0` = homepage only, `1` = homepage + whatever it links to, `2` = plus one more layer, etc. Omit for no limit. Combine with a small `--max-pages` for a quick "top-level pages only" pass |
 | `--slow` | Conservative mode: longer waits between requests |
 | `--respect-robots` | Skip URLs/paths disallowed by robots.txt |
 | `--intensity <light\|normal\|aggressive>` | One dial for concurrency/delay/probe-list-size across path probing, port scanning, and subdomain liveness checks (default `normal`) |
@@ -268,6 +269,17 @@ node bin/universal-security-audit.mjs help
 ```
 
 ## Example workflows by site type / use case
+
+### Small stakeholder-facing overview (skip deep/individual-record pages)
+
+For sites with lots of per-record pages (fundraiser/participant pages, product listings, forum threads, etc.) where you just want a quick, presentable snapshot rather than exhaustive coverage:
+
+```bash
+node bin/universal-security-audit.mjs audit --site https://www.example.com \
+  --crawl --max-depth 2 --max-pages 25 --intensity light --respect-robots
+```
+
+`--max-depth 2` keeps the crawl to the homepage, its direct nav links, and one layer of their children — the pages that actually represent the site's structure — without falling into individual per-record pages several links deep. `--max-pages 25` is a backstop in case even that top layer is large. Good enough to hand stakeholders a representative grade and findings list without a multi-hour run.
 
 ### Quick first-pass on a live WordPress site
 

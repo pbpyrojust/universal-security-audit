@@ -273,6 +273,9 @@ const maxPages = args['max-pages'] ? Number(args['max-pages']) : Infinity;
 // crawled — without this, sites with per-record pages (fundraiser pages, product pages, forum
 // threads, etc.) turn an uncapped --crawl into a crawl trap of thousands of near-duplicate pages.
 const maxPerTemplate = args['max-per-url-pattern'] ? Number(args['max-per-url-pattern']) : 3;
+// How many link "hops" from the homepage --crawl will follow: 0 = homepage only, 1 = homepage +
+// whatever it links to, 2 = plus one more layer of children, etc. No flag = no limit (full crawl).
+const maxDepth = args['max-depth'] ? Number(args['max-depth']) : Infinity;
 const slowMode = Boolean(args['slow']);
 const respectRobots = Boolean(args['respect-robots']);
 const skipExposedPaths = Boolean(args['skip-exposed-paths']);
@@ -372,39 +375,49 @@ function urlTemplate(url) {
   } catch { return url; }
 }
 
-async function crawlForUrls(site, { maxPages, isAllowedUrl, maxPerTemplate = 3 }) {
+async function crawlForUrls(site, { maxPages, isAllowedUrl, maxPerTemplate = 3, maxDepth = Infinity }) {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
   const seen = new Set([site]);
-  const queue = [site];
+  const queue = [{ url: site, depth: 0 }];
   const templateCounts = new Map();
   let skippedByTemplate = 0;
+  let skippedByDepth = 0;
   const crawlStart = Date.now();
   while (queue.length && seen.size < maxPages) {
-    const url = queue.shift();
+    const { url, depth } = queue.shift();
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      const hrefs = await page.$$eval('a[href]', (as) => as.map((a) => a.href));
-      for (const href of hrefs) {
-        const abs = normalizeUrl(href);
-        if (!sameOrigin(abs, site) || !isCrawlablePage(abs) || seen.has(abs)) continue;
-        if (isAllowedUrl && !isAllowedUrl(abs)) continue;
-        if (seen.size >= maxPages) break;
-        const template = urlTemplate(abs);
-        const count = templateCounts.get(template) || 0;
-        if (count >= maxPerTemplate) { skippedByTemplate++; continue; }
-        templateCounts.set(template, count + 1);
-        seen.add(abs);
-        queue.push(abs);
+      if (depth < maxDepth) {
+        const hrefs = await page.$$eval('a[href]', (as) => as.map((a) => a.href));
+        for (const href of hrefs) {
+          const abs = normalizeUrl(href);
+          if (!sameOrigin(abs, site) || !isCrawlablePage(abs) || seen.has(abs)) continue;
+          if (isAllowedUrl && !isAllowedUrl(abs)) continue;
+          if (seen.size >= maxPages) break;
+          const template = urlTemplate(abs);
+          const count = templateCounts.get(template) || 0;
+          if (count >= maxPerTemplate) { skippedByTemplate++; continue; }
+          templateCounts.set(template, count + 1);
+          seen.add(abs);
+          queue.push({ url: abs, depth: depth + 1 });
+        }
+      } else {
+        skippedByDepth++;
       }
     } catch {}
     const shortUrl = url.length > 60 ? url.slice(0, 57) + '...' : url;
-    const extra = `${c.dim}queue:${c.reset} ${c.brightYellow}${queue.length}${c.reset} ${c.dim}·${c.reset} elapsed ${c.brightYellow}${formatDuration(Date.now() - crawlStart)}${c.reset}${skippedByTemplate ? ` ${c.dim}·${c.reset} skipped ${c.brightYellow}${skippedByTemplate}${c.reset} repeat-template pages` : ''} ${c.dim}·${c.reset} ${shortUrl}`;
+    const capNotes = [
+      skippedByTemplate ? `skipped ${c.brightYellow}${skippedByTemplate}${c.reset} repeat-template` : '',
+      skippedByDepth ? `${c.brightYellow}${skippedByDepth}${c.reset} beyond max depth` : '',
+    ].filter(Boolean).join(', ');
+    const extra = `${c.dim}queue:${c.reset} ${c.brightYellow}${queue.length}${c.reset} ${c.dim}·${c.reset} elapsed ${c.brightYellow}${formatDuration(Date.now() - crawlStart)}${c.reset}${capNotes ? ` ${c.dim}·${c.reset} ${capNotes}` : ''} ${c.dim}·${c.reset} ${shortUrl}`;
     progressLine(seen.size, maxPages, 'pages found', extra);
   }
   clearProgressLine();
   await browser.close();
   if (skippedByTemplate) statusMsg('🪤', c.dim, `Skipped ${skippedByTemplate} additional page(s) that matched an already-sampled URL template (e.g. paginated/per-record pages) — capped at ${maxPerTemplate} per template to avoid a crawl trap. Use --max-per-url-pattern to change this.`);
+  if (skippedByDepth) statusMsg('🌳', c.dim, `Did not follow links from ${skippedByDepth} page(s) beyond --max-depth ${maxDepth}.`);
   return [...seen];
 }
 
@@ -414,7 +427,7 @@ let pageUrls = [site];
 let sitemapDiscovery = { sitemapUrl: null, robotsDeclaredSitemaps: [], sitemapDeclaredInRobots: false };
 if (args['crawl']) {
   if (!Number.isFinite(maxPages)) statusMsg('🕷️', c.dim, 'No --max-pages set — crawling until every reachable internal link is exhausted (pass --max-pages to cap this on large sites).');
-  pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl, maxPerTemplate });
+  pageUrls = await crawlForUrls(site, { maxPages, isAllowedUrl: robotsCfg.isAllowedUrl, maxPerTemplate, maxDepth });
   statusMsg('🕷️', c.brightGreen, `Crawled ${pageUrls.length} page(s) via link-following.`);
 } else {
   try {
