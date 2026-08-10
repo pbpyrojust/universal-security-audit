@@ -698,7 +698,7 @@ for (let i = 0; i < pageUrls.length; i++) {
     if (!siteGenerator && inv.generator) siteGenerator = inv.generator;
     if (i === 0) siteHtmlSample = html;
 
-    const platformSignals = detectPlatform({ html, headers: pageHeaders, scriptSrcs: inv.scriptUrls, cookieNames: cookies.map((ck) => ck.name) });
+    const platformSignals = detectPlatform({ html, headers: pageHeaders, scriptSrcs: inv.scriptUrls, cookieNames: cookies.map((ck) => ck.name), siteUrl: url });
     pageHeaderSets.push({ url, server: pageHeaders['server'] || '', poweredBy: pageHeaders['x-powered-by'] || '', via: pageHeaders['via'] || '' });
     const pii = scanForPii(html);
     const payments = detectPaymentProcessors(html, inv.scriptUrls);
@@ -731,7 +731,7 @@ phaseDone('Page scanning', Date.now() - scanStart);
 // ── Phase 9: Platform + third-party library inventory ──────────────────
 phaseHeader('Phase 9: Platform & library inventory', '📦');
 const invStart = Date.now();
-const platformSignals = detectPlatform({ html: siteHtmlSample, headers: homepageHeaders, scriptSrcs: allScriptUrls, cookieNames: [] });
+const platformSignals = detectPlatform({ html: siteHtmlSample, headers: homepageHeaders, scriptSrcs: allScriptUrls, cookieNames: [], siteUrl: site });
 const primaryPlatform = platformSignals[0]?.platform || 'Unknown/Custom';
 statusMsg('🧩', c.brightCyan, `Detected platform: ${c.bold}${primaryPlatform}${c.reset} (${platformSignals[0]?.confidence || 'low'} confidence)`);
 

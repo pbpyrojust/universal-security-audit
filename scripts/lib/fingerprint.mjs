@@ -2,7 +2,7 @@
 import dns from 'node:dns/promises';
 import tls from 'node:tls';
 
-export function detectPlatform({ html = '', headers = {}, scriptSrcs = [], cookieNames = [] }) {
+export function detectPlatform({ html = '', headers = {}, scriptSrcs = [], cookieNames = [], siteUrl = '' }) {
   const h = html.toLowerCase();
   const get = (name) => (headers.get ? headers.get(name) : headers[name]) || '';
   const server = String(get('server') || '').toLowerCase();
@@ -13,8 +13,33 @@ export function detectPlatform({ html = '', headers = {}, scriptSrcs = [], cooki
   const signals = [];
   const add = (platform, confidence, reason) => signals.push({ platform, confidence, reason });
 
-  if (h.includes('wp-content') || h.includes('wp-includes') || scripts.includes('wp-content') || h.includes('name="generator" content="wordpress')) {
+  // wp-content/wp-includes are literal upload/asset paths — they can show up in a page's HTML
+  // purely because it links to an image/script hosted on a *different* WordPress site (a blog
+  // subdomain, an embedded widget, etc). Only treat them as "this site is WordPress" when the
+  // reference is same-origin; a cross-origin match is reported separately so it doesn't get
+  // mistaken for this host's own platform (and doesn't trigger false hybrid-architecture alerts).
+  let siteHost = '';
+  try { siteHost = new URL(siteUrl).hostname.toLowerCase(); } catch { /* no siteUrl given */ }
+  const isSameOriginRef = (urlStr) => {
+    if (!urlStr) return true;
+    if (urlStr.startsWith('/') && !urlStr.startsWith('//')) return true; // root-relative path
+    try {
+      return !siteHost || new URL(urlStr, `https://${siteHost}`).hostname.toLowerCase() === siteHost;
+    } catch { return true; }
+  };
+  const wpPathMatches = html.match(/[^\s"'<>]*\/wp-(?:content|includes)\/[^\s"'<>]*/gi) || [];
+  const wpSameOriginHtml = wpPathMatches.some(isSameOriginRef);
+  const wpCrossOriginMatches = wpPathMatches.filter((m) => !isSameOriginRef(m));
+  const wpSameOriginScript = scriptSrcs.some((s) => /\/wp-content\//i.test(s) && isSameOriginRef(s));
+  const hasGeneratorTag = h.includes('name="generator" content="wordpress');
+
+  if (wpSameOriginHtml || wpSameOriginScript || hasGeneratorTag) {
     add('WordPress', 'high', 'wp-content/wp-includes paths or generator meta tag found.');
+  } else if (wpCrossOriginMatches.length) {
+    const externalHosts = [...new Set(wpCrossOriginMatches.map((m) => {
+      try { return new URL(m, `https://${siteHost || 'example.com'}`).hostname; } catch { return null; }
+    }).filter(Boolean))];
+    add('WordPress (external reference)', 'info', `Page links to wp-content/wp-includes assets hosted on a different domain (${externalHosts.join(', ') || 'unknown host'}) — likely a separate WordPress site (e.g. a blog subdomain), not this scanned host.`);
   }
   if (h.includes('/sites/default/files') || h.includes('drupal.settings') || cookies.includes('has_js') || h.includes('drupal-')) {
     add('Drupal', 'high', 'Drupal-specific paths, settings object, or cookie found.');
