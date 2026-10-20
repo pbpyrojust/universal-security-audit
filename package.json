@@ -1,5 +1,5 @@
 {
-  "name": "universal-security-audit",
+  "name": "@pbpyrojust/universal-security-audit",
   "version": "0.2.0",
   "type": "module",
   "packageManager": "pnpm@10.8.0",
@@ -55,5 +55,8 @@
     "drupal",
     "tls",
     "port-scan"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }

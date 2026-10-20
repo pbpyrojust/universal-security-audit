@@ -91,6 +91,18 @@ This is the one part of the tool that requires you to hand it real credentials â
 
 ## Install
 
+From npm (`@pbpyrojust/universal-security-audit`):
+
+```bash
+npm install -g @pbpyrojust/universal-security-audit
+npx playwright install chromium
+universal-security-audit --site https://www.example.com
+```
+
+Or without installing: `npm exec --package @pbpyrojust/universal-security-audit -- universal-security-audit --site https://www.example.com`.
+
+From a clone of this repository:
+
 ```bash
 pnpm install
 npx playwright install chromium
