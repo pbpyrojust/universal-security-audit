@@ -4,6 +4,16 @@ Technical security & attack-surface audit CLI. Companion tool to [universal-seo-
 
 Runs a battery of unauthenticated, publicly-visible checks against a website and produces a risk-graded HTML/PDF dashboard, CSV data files, a ticket-ready backlog, and run-over-run comparisons.
 
+## What's new in 0.2.0
+
+- **security.txt (RFC 9116) validation:** finds it at `/.well-known/security.txt` (or the legacy `/security.txt`) and checks the required Contact and Expires fields, an expiry date that hasn't passed (and isn't more than a year out), HTTPS, `text/plain`, Canonical and Policy; reports PGP signing. A missing or expired file is a finding.
+- **WPScan free tier:** when the daily limit (25 requests) is hit, the remaining WordPress CVE lookups are skipped with one clear message instead of an error per plugin.
+- Playwright 1.64, undici 8.12 and current dependencies.
+
+## Part of Vinny
+
+This scanner is the free, open-source engine behind the security checks in [Vinny](https://vinny.justwhat.net) and the [WordPress plugins](https://wordpress.justwhat.net). Everything here stays free.
+
 ## ⚠️ Authorized use only
 
 This tool actively sends requests to well-known admin/login/config paths, DNS-probes common subdomains, TCP-connects to common service ports, and queries third-party vulnerability databases. **Only run it against sites/infrastructure you own or have explicit written permission to test.** Every probe is a single unauthenticated GET/OPTIONS/DNS/TCP-connect to a publicly documented path, record, or port — no auth bypass, brute force, fuzzing, or payload injection is performed, and destructive HTTP verbs (PUT/DELETE) are only *introspected* via OPTIONS, never sent. The one exception is the **authenticated admin audit** (see below), which requires you to supply valid login credentials yourself — it only ever reads screens the logged-in account already has access to. Unauthorized scanning of third-party infrastructure may still violate computer-fraud laws or terms of service even when every individual request is "harmless" on its own.
@@ -116,7 +126,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | `--skip-subdomain-enum` | Skip crt.sh subdomain enumeration |
 | `--skip-whois` | Skip the WHOIS/RDAP domain-registration lookup |
 | `--skip-admin-audit` | Skip the authenticated admin audit even if credentials are supplied |
-| `--wpscan-key <key>` | WPScan Vulnerability API token (or set `WPSCAN_API_KEY` env var) |
+| `--wpscan-key <key>` | Your own WPScan Vulnerability API token (or set `WPSCAN_API_KEY` env var) — free tier is 25 requests/day; see [WordPress CVE lookups](#wordpress-cve-lookups) |
 | `--brand-config <path>` | JSON file to white-label the HTML/PDF report (see below) |
 | `--proxy <url>` | Route all traffic (fetch + browser) through an upstream proxy, e.g. Burp Suite / OWASP ZAP, for manual inspection/replay |
 | `--fail-on <severity>` | Exit code 1 if any *active* (non-suppressed) finding at or above this severity exists (`critical`/`high`/`medium`/`low`) — for CI gating |
@@ -152,14 +162,16 @@ node scripts/run-security-audit.mjs --site https://www.example.com \
 
 ### WordPress CVE lookups
 
-WordPress core/plugin/theme vulnerability matching uses the [WPScan Vulnerability Database API](https://wpscan.com/api). Register for a free API key (25 requests/day) at wpscan.com, then either:
+WordPress core/plugin/theme vulnerability matching uses the [WPScan Vulnerability Database API](https://wpscan.com/api), which requires an API key — there's no shared/bundled key in this repo, so each user registers their own for free at wpscan.com. Set it either way:
 
 ```bash
 export WPSCAN_API_KEY=your-key-here
 node scripts/run-security-audit.mjs --site https://www.example.com
 ```
 
-or pass `--wpscan-key your-key-here`. Without a key, core/plugin/theme versions are still detected and reported — just without live CVE matching.
+or pass it per-run with `--wpscan-key your-key-here` (this takes precedence over the env var). Without a key, core/plugin/theme versions are still detected and reported — just without live CVE matching.
+
+The free WPScan tier is capped at **25 requests/day**. If a scan hits that cap mid-run (checking WordPress core plus every detected plugin/theme can use up the quota quickly), the tool detects the `429` response, prints a one-time warning to the console telling you the daily limit was hit, and skips the remaining WPScan lookups for that run rather than continuing to burn failed requests — everything else in the scan (headers, exposed paths, PII/payment detection, non-WPScan CVE sources, etc.) still completes normally. The quota resets daily; see [wpscan.com/api](https://wpscan.com/api) for paid tiers with a higher limit.
 
 ## Output
 

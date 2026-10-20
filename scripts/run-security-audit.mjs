@@ -14,6 +14,7 @@ import {
 import { npmPackageNameFor, osvLookup, wpscanCoreLookup, wpscanPluginLookup, wpscanThemeLookup } from './lib/vuln-lookup.mjs';
 import { scanForPii, detectPaymentProcessors } from './lib/pii-payment.mjs';
 import { checkCorsMisconfig, findMixedContent, summarizeCrawlerExposure } from './lib/misc-checks.mjs';
+import { checkSecurityTxt } from './lib/security-txt.mjs';
 import { computeRiskGrade, sortFindingsBySeverity, isGradeBelow, hasFindingAtOrAbove } from './lib/scoring.mjs';
 import {
   checkSubdomainTakeover, checkHttpMethods, checkOpenRedirect, checkMissingSri,
@@ -530,6 +531,18 @@ if (corsResult.checked && corsResult.misconfigured) {
   addFinding({ category: 'cors', severity: 'low', title: 'CORS reflects/wildcards Origin', detail: corsResult.note, url: site });
 }
 
+// security.txt (RFC 9116), added 0.2.0.
+const securityTxt = await checkSecurityTxt(origin);
+if (!securityTxt.found) {
+  statusMsg('🛡️', c.dim, 'security.txt: absent');
+  addFinding({ category: 'security-txt', severity: 'low', title: 'No security.txt (RFC 9116)', detail: 'Researchers who find a vulnerability have no published way to report it. Add /.well-known/security.txt with at least a Contact and an Expires field (generator: https://securitytxt.org).', url: securityTxt.url });
+} else {
+  statusMsg('🛡️', c.dim, `security.txt: present${securityTxt.legacyLocation ? ' (legacy /security.txt location)' : ''}${securityTxt.signed ? ', PGP-signed' : ''}${securityTxt.problems.length ? `, ${securityTxt.problems.length} problem(s)` : ', valid'}`);
+  for (const p of securityTxt.problems) addFinding({ category: 'security-txt', severity: /Expired/.test(p) ? 'medium' : 'low', title: `security.txt: ${p.split(':')[0].split('.')[0]}`, detail: p, url: securityTxt.url });
+  for (const w of securityTxt.warnings) addFinding({ category: 'security-txt', severity: 'info', title: `security.txt: ${w.split(':')[0].split(';')[0].split('.')[0]}`, detail: w, url: securityTxt.url });
+  if (securityTxt.legacyLocation) addFinding({ category: 'security-txt', severity: 'info', title: 'security.txt is only at the legacy location', detail: 'RFC 9116 puts it at /.well-known/security.txt; /security.txt is a legacy fallback. Serve it (or a redirect) from /.well-known/.', url: securityTxt.url });
+}
+
 const crawlerExposure = await summarizeCrawlerExposure(origin, sitemapDiscovery);
 statusMsg('🤖', c.dim, `robots.txt: ${crawlerExposure.hasRobots ? 'present' : 'absent'} · llms.txt: ${crawlerExposure.hasLlmsTxt ? 'present' : 'absent'} · sitemap: ${crawlerExposure.hasSitemap ? 'present' : crawlerExposure.hasSitemap === false ? 'absent' : 'not checked'}`);
 if (crawlerExposure.sensitiveLookingDisallows.length) {
@@ -815,15 +828,24 @@ if (!skipCve) {
     if (!wpscanApiKey) {
       statusMsg('⏭', c.dim, 'No WPSCAN_API_KEY set — skipping live WordPress CVE lookups (core/plugin/theme version + EOL heuristics still reported).');
     } else {
+      let wpscanRateLimited = false;
+      const warnRateLimit = () => {
+        if (wpscanRateLimited) return;
+        wpscanRateLimited = true;
+        statusMsg('⚠', c.brightYellow, 'WPScan free-tier daily limit (25 requests/day) reached — remaining WordPress CVE lookups skipped for this run. Limit resets daily; see https://wpscan.com/api for paid tiers.');
+      };
+
       if (wpCore.version) {
         const coreRes = await wpscanCoreLookup(wpCore.version, wpscanApiKey);
         if (coreRes.vulns?.length) {
           vulnResults.push({ component: `WordPress core ${wpCore.version}`, source: 'WPScan', vulns: coreRes.vulns });
           for (const v of coreRes.vulns) addFinding({ category: 'cve', severity: 'critical', title: `WordPress core ${wpCore.version}: ${v.title}`, detail: v.fixedIn ? `Fixed in ${v.fixedIn}.` : 'No fix version listed.', url: Array.isArray(v.references) ? v.references[0] : String(v.references || '') });
         }
-        if (coreRes.error) statusMsg('⚠', c.brightYellow, `WPScan core lookup: ${coreRes.error}`);
+        if (coreRes.rateLimited) warnRateLimit();
+        else if (coreRes.error) statusMsg('⚠', c.brightYellow, `WPScan core lookup: ${coreRes.error}`);
       }
       for (const p of wpPlugins) {
+        if (wpscanRateLimited) break;
         const res = await wpscanPluginLookup(p.slug, wpscanApiKey);
         if (res.vulns?.length) {
           const applicable = p.version ? res.vulns.filter((v) => !v.fixedIn || semverLt(p.version, v.fixedIn)) : res.vulns;
@@ -832,9 +854,12 @@ if (!skipCve) {
             for (const v of applicable) addFinding({ category: 'cve', severity: p.version ? 'critical' : 'medium', title: `WP plugin "${p.slug}": ${v.title}`, detail: `${p.version ? `Installed: ${p.version}. ` : 'Version undetected — verify manually. '}${v.fixedIn ? `Fixed in ${v.fixedIn}.` : ''}`, url: Array.isArray(v.references) ? v.references[0] : String(v.references || '') });
           }
         }
+        if (res.rateLimited) { warnRateLimit(); break; }
+        if (res.error) statusMsg('⚠', c.brightYellow, `WPScan plugin lookup (${p.slug}): ${res.error}`);
         await sleep(250); // stay well under WPScan free-tier rate limit
       }
       for (const t of wpThemes) {
+        if (wpscanRateLimited) break;
         const res = await wpscanThemeLookup(t.slug, wpscanApiKey);
         if (res.vulns?.length) {
           const applicable = t.version ? res.vulns.filter((v) => !v.fixedIn || semverLt(t.version, v.fixedIn)) : res.vulns;
@@ -843,6 +868,8 @@ if (!skipCve) {
             for (const v of applicable) addFinding({ category: 'cve', severity: t.version ? 'high' : 'medium', title: `WP theme "${t.slug}": ${v.title}`, detail: `${t.version ? `Installed: ${t.version}. ` : 'Version undetected — verify manually. '}${v.fixedIn ? `Fixed in ${v.fixedIn}.` : ''}`, url: Array.isArray(v.references) ? v.references[0] : String(v.references || '') });
           }
         }
+        if (res.rateLimited) { warnRateLimit(); break; }
+        if (res.error) statusMsg('⚠', c.brightYellow, `WPScan theme lookup (${t.slug}): ${res.error}`);
         await sleep(250);
       }
     }
