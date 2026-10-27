@@ -12,7 +12,7 @@ Runs a battery of unauthenticated, publicly-visible checks against a website and
 
 ## Part of Vinny
 
-This scanner is the free, open-source engine behind the security checks in [Vinny](https://vinny.justwhat.net) and the [WordPress plugins](https://wordpress.justwhat.net). Everything here stays free.
+This scanner is the free, open-source engine behind the [security checks in Vinny](https://vinny.justwhat.net/features/#security). Everything here stays free. [Vinny](https://vinny.justwhat.net) runs the same header grading on a schedule for any website, alongside [accessibility](https://vinny.justwhat.net/features/#accessibility), [SEO and rank tracking](https://vinny.justwhat.net/features/#seo), with history, alerts and fix tickets ([free for one site](https://vinny.justwhat.net/pricing/)). For WordPress, the [Universal Security Audit plugin](https://wordpress.justwhat.net/#plugins-heading) is coming soon.
 
 ## ⚠️ Authorized use only
 
