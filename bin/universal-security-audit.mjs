@@ -37,6 +37,7 @@ Examples:
   universal-security-audit audit --site https://www.example.com
   universal-security-audit audit --site https://www.example.com --crawl --max-pages 25
   universal-security-audit audit --site https://www.example.com --authorized --intensity aggressive
+  universal-security-audit audit --site https://www.example.com --wordfence-key YOUR_KEY
   universal-security-audit audit --site https://www.example.com --wpscan-key YOUR_KEY
   universal-security-audit audit --site https://www.example.com --skip-exposed-paths --skip-recon
   universal-security-audit audit --site https://www.example.com --login-url https://www.example.com/wp-login.php --username U --password P

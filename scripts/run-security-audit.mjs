@@ -42,6 +42,7 @@ import { enumerateTlsProtocols, getWeakProtocolFindings } from './lib/tls-enum.m
 import { introspectGraphQL } from './lib/graphql-introspect.mjs';
 import { loadBaseline, applyBaseline } from './lib/baseline.mjs';
 import { resolveAuthorization, ACTIVE_CHECKS } from './lib/authorization.mjs';
+import { loadIndex as loadWordfenceIndex, lookup as wordfenceLookup, severityOf as wordfenceSeverity, WORDFENCE_ATTRIBUTION } from './lib/wordfence.mjs';
 
 // ── CLI / generic helpers ───────────────────────────────────────────────
 function parseArgs(argv) {
@@ -291,6 +292,7 @@ const skipSubdomainEnum = Boolean(args['skip-subdomain-enum']) || !activeAllowed
 const skipWhois = Boolean(args['skip-whois']);
 const skipAdminAudit = Boolean(args['skip-admin-audit']) || !activeAllowed;
 const wpscanApiKey = args['wpscan-key'] || process.env.WPSCAN_API_KEY || '';
+const wordfenceApiKey = args['wordfence-key'] || process.env.WORDFENCE_API_KEY || '';
 const branding = loadBranding(fs, path, args['brand-config']);
 const intensity = resolveIntensity(args['intensity']);
 const proxyUrl = args['proxy'] || '';
@@ -314,7 +316,7 @@ out(`  ${rainbow('╚═══════════════════�
 out('');
 out(`  ${c.brightMagenta}🎯${c.reset} ${c.bold}Target:${c.reset}     ${c.brightCyan}${site}${c.reset}`);
 out(`  ${c.brightMagenta}📁${c.reset} ${c.bold}Output:${c.reset}     ${c.dim}${outDir}${c.reset}`);
-out(`  ${c.brightMagenta}🔑${c.reset} ${c.bold}WPScan key:${c.reset} ${wpscanApiKey ? `${c.brightGreen}configured${c.reset}` : `${c.dim}not set (WordPress CVE lookups will be skipped)${c.reset}`}`);
+out(`  ${c.brightMagenta}🔑${c.reset} ${c.bold}WordPress CVE data:${c.reset} ${[wordfenceApiKey && `${c.brightGreen}Wordfence${c.reset}`, wpscanApiKey && `${c.brightGreen}WPScan${c.reset}`].filter(Boolean).join(' + ') || `${c.dim}no key (set WORDFENCE_API_KEY or WPSCAN_API_KEY to look up WordPress vulnerabilities)${c.reset}`}`);
 out(`  ${c.brightMagenta}⚡${c.reset} ${c.bold}Intensity:${c.reset}  ${args['intensity'] || 'normal'}${proxyUrl ? `  ${c.dim}·${c.reset} proxying via ${proxyUrl}` : ''}`);
 if (authSettings.httpCredentials || authSettings.formAuth) console.log(`  ${c.brightMagenta}🔐${c.reset} ${c.bold}Auth:${c.reset}       ${authSettings.formAuth ? 'form login configured' : 'HTTP basic credentials configured'}`);
 if (activeAllowed) {
@@ -834,7 +836,7 @@ if (!skipCve) {
 
   if (primaryPlatform === 'WordPress') {
     if (!wpscanApiKey) {
-      statusMsg('⏭', c.dim, 'No WPSCAN_API_KEY set — skipping live WordPress CVE lookups (core/plugin/theme version + EOL heuristics still reported).');
+      if (!wordfenceApiKey) statusMsg('⏭', c.dim, 'No WORDFENCE_API_KEY or WPSCAN_API_KEY set — skipping live WordPress CVE lookups (core/plugin/theme version + EOL heuristics still reported).');
     } else {
       let wpscanRateLimited = false;
       const warnRateLimit = () => {
@@ -889,6 +891,31 @@ if (!skipCve) {
         if (stopOnRefusal(res, `theme (${t.slug})`)) break;
         await sleep(250);
       }
+    }
+  }
+
+  // Wordfence Intelligence, with the user's own key (free, commercial use allowed with attribution).
+  if (primaryPlatform === 'WordPress' && wordfenceApiKey) {
+    const { index, error } = await loadWordfenceIndex(wordfenceApiKey);
+    if (error) statusMsg('⚠', c.brightYellow, `Wordfence: ${error}.`);
+    if (index) {
+      // Components WPScan already reported aren't repeated.
+      const seen = new Set(vulnResults.map((r) => r.component.replace(/@.*$/, '')));
+      const components = [
+        ...(wpCore.version ? [{ kind: 'core', slug: 'wordpress', version: wpCore.version, label: `WordPress core ${wpCore.version}`, key: `WordPress core ${wpCore.version}` }] : []),
+        ...wpPlugins.map((p) => ({ kind: 'plugin', slug: p.slug, version: p.version, label: `WP plugin "${p.slug}"`, key: `plugin:${p.slug}` })),
+        ...wpThemes.map((t) => ({ kind: 'theme', slug: t.slug, version: t.version, label: `WP theme "${t.slug}"`, key: `theme:${t.slug}` })),
+      ];
+      let wfFound = 0;
+      for (const comp of components) {
+        if (!comp.version || seen.has(comp.key.replace(/@.*$/, ''))) continue;
+        const vulns = wordfenceLookup(index, comp.kind, comp.slug, comp.version);
+        if (!vulns.length) continue;
+        wfFound += 1;
+        vulnResults.push({ component: comp.kind === 'core' ? comp.key : `${comp.key}@${comp.version}`, source: 'Wordfence', vulns: vulns.map((v) => ({ id: v.id, title: v.title, fixedIn: v.fixedIn, references: [v.url] })) });
+        for (const v of vulns) addFinding({ category: 'cve', severity: wordfenceSeverity(v), title: `${comp.label}: ${v.title}`, detail: `Installed: ${comp.version}. ${v.fixedIn ? `Fixed in ${v.fixedIn}.` : 'No fix yet.'}${v.cve ? ` ${v.cve}.` : ''} ${WORDFENCE_ATTRIBUTION}`, url: v.url });
+      }
+      statusMsg('🛡️', c.dim, `Wordfence: ${wfFound} component(s) with known vulnerabilities.`);
     }
   }
   statusMsg('🛡️', c.dim, `${vulnResults.length} component(s) with known vulnerabilities found.`);

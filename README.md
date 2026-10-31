@@ -9,6 +9,7 @@ Runs a battery of unauthenticated, publicly-visible checks against a website and
 - **Pentest checks need confirmed permission.** The active checks (exposed paths and admin/login pages, GraphQL introspection, subdomain liveness, the port scan, open-redirect/HTTP-method/user-enumeration/error-disclosure probes, and the authenticated admin audit) only run when you confirm you own the site or have the owner's written permission: `--authorized`, or typing "yes" at the prompt. Without it a run is passive only. The confirmation (exact statement, time, user, how) is saved in `summary.json` and `full-report.json`. **Scripts and CI that relied on the active checks need `--authorized` added.**
 - **Open redirect:** only a redirect whose destination is the test host counts. Sites that redirect www → apex (or http → https) keep the query string, which made every redirect parameter a false positive.
 - **WPScan:** a refused key (WPScan answers 403 for a missing or invalid token) now stops the lookups after the first one with one message.
+- **Wordfence Intelligence** as a second source of WordPress core/plugin/theme vulnerabilities, with your own free key (`--wordfence-key` or `WORDFENCE_API_KEY`). Only for sites detected as WordPress. The feed is downloaded at most once a day and kept as a compact index in `~/.cache/universal-security-audit/`; components WPScan already reported aren't repeated. See [WordPress CVE lookups](#wordpress-cve-lookups).
 
 ## What's new in 0.2.0
 
@@ -156,6 +157,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | `--skip-subdomain-enum` | Skip crt.sh subdomain enumeration |
 | `--skip-whois` | Skip the WHOIS/RDAP domain-registration lookup |
 | `--skip-admin-audit` | Skip the authenticated admin audit even if credentials are supplied |
+| `--wordfence-key <key>` | Your own Wordfence Intelligence API key (or set `WORDFENCE_API_KEY`): free, commercial use allowed with attribution. WordPress sites only; see [WordPress CVE lookups](#wordpress-cve-lookups) |
 | `--wpscan-key <key>` | Your own WPScan Vulnerability API token (or set `WPSCAN_API_KEY` env var) — free tier is 25 requests/day; see [WordPress CVE lookups](#wordpress-cve-lookups) |
 | `--brand-config <path>` | JSON file to white-label the HTML/PDF report (see below) |
 | `--proxy <url>` | Route all traffic (fetch + browser) through an upstream proxy, e.g. Burp Suite / OWASP ZAP, for manual inspection/replay |
@@ -192,7 +194,10 @@ node scripts/run-security-audit.mjs --site https://www.example.com \
 
 ### WordPress CVE lookups
 
-WordPress core/plugin/theme vulnerability matching uses the [WPScan Vulnerability Database API](https://wpscan.com/api), which requires an API key — there's no shared/bundled key in this repo, so each user registers their own for free at wpscan.com. Set it either way:
+WordPress core/plugin/theme vulnerability matching only runs for sites detected as WordPress, and only with a key you supply. Two sources, use either or both:
+
+- **[Wordfence Intelligence](https://www.wordfence.com/threat-intel/)** (`WORDFENCE_API_KEY` or `--wordfence-key`): free for commercial and personal use with attribution; create a key at wordfence.com under Account → Integrations. The full feed (~160 MB) is downloaded at most once every 24 hours and kept as a compact index (~18 MB) in `~/.cache/universal-security-audit/wordfence-index.json` (or `$XDG_CACHE_HOME`); the key's download limit is small, so if a refresh is refused the cached copy is used. Findings credit Wordfence and Defiant Inc. as its license requires.
+- **WPScan**: uses the [WPScan Vulnerability Database API](https://wpscan.com/api), which requires an API key — there's no shared/bundled key in this repo, so each user registers their own for free at wpscan.com. Set it either way:
 
 ```bash
 export WPSCAN_API_KEY=your-key-here
