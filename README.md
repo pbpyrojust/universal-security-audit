@@ -197,7 +197,7 @@ node scripts/run-security-audit.mjs --site https://www.example.com \
 WordPress core/plugin/theme vulnerability matching only runs for sites detected as WordPress, and only with a key you supply. Two sources, use either or both:
 
 - **[Wordfence Intelligence](https://www.wordfence.com/threat-intel/)** (`WORDFENCE_API_KEY` or `--wordfence-key`): free for commercial and personal use with attribution; create a key at wordfence.com under Account → Integrations. The full feed (~160 MB) is downloaded at most once every 24 hours and kept as a compact index (~18 MB) in `~/.cache/universal-security-audit/wordfence-index.json` (or `$XDG_CACHE_HOME`); the key's download limit is small, so if a refresh is refused the cached copy is used. Findings credit Wordfence and Defiant Inc. as its license requires.
-- **WPScan**: uses the [WPScan Vulnerability Database API](https://wpscan.com/api), which requires an API key — there's no shared/bundled key in this repo, so each user registers their own for free at wpscan.com. Set it either way:
+- **WPScan**: uses the [WPScan Vulnerability Database API](https://wpscan.com/api), which requires an API key — there's no shared/bundled key in this repo, so each user registers their own at wpscan.com. WPScan's free key is for non-commercial use; for client or commercial work use Wordfence or a paid WPScan plan. Set it either way:
 
 ```bash
 export WPSCAN_API_KEY=your-key-here
