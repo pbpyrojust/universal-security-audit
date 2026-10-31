@@ -4,6 +4,12 @@ Technical security & attack-surface audit CLI. Companion tool to [universal-seo-
 
 Runs a battery of unauthenticated, publicly-visible checks against a website and produces a risk-graded HTML/PDF dashboard, CSV data files, a ticket-ready backlog, and run-over-run comparisons.
 
+## What's new in 0.3.0
+
+- **Pentest checks need confirmed permission.** The active checks (exposed paths and admin/login pages, GraphQL introspection, subdomain liveness, the port scan, open-redirect/HTTP-method/user-enumeration/error-disclosure probes, and the authenticated admin audit) only run when you confirm you own the site or have the owner's written permission: `--authorized`, or typing "yes" at the prompt. Without it a run is passive only. The confirmation (exact statement, time, user, how) is saved in `summary.json` and `full-report.json`. **Scripts and CI that relied on the active checks need `--authorized` added.**
+- **Open redirect:** only a redirect whose destination is the test host counts. Sites that redirect www → apex (or http → https) keep the query string, which made every redirect parameter a false positive.
+- **WPScan:** a refused key (WPScan answers 403 for a missing or invalid token) now stops the lookups after the first one with one message.
+
 ## What's new in 0.2.0
 
 - **security.txt (RFC 9116) validation:** finds it at `/.well-known/security.txt` (or the legacy `/security.txt`) and checks the required Contact and Expires fields, an expiry date that hasn't passed (and isn't more than a year out), HTTPS, `text/plain`, Canonical and Policy; reports PGP signing. A missing or expired file is a finding.
@@ -14,9 +20,20 @@ Runs a battery of unauthenticated, publicly-visible checks against a website and
 
 This scanner is the free, open-source engine behind the [security checks in Vinny](https://vinny.justwhat.net/features/#security). Everything here stays free. [Vinny](https://vinny.justwhat.net) runs the same header grading on a schedule for any website, alongside [accessibility](https://vinny.justwhat.net/features/#accessibility), [SEO and rank tracking](https://vinny.justwhat.net/features/#seo), with history, alerts and fix tickets ([free for one site](https://vinny.justwhat.net/pricing/)). For WordPress, the [Universal Security Audit plugin](https://wordpress.justwhat.net/#plugins-heading) is coming soon.
 
-## ⚠️ Authorized use only
+## ⚠️ Authorized use only: pentest checks need written permission
 
-This tool actively sends requests to well-known admin/login/config paths, DNS-probes common subdomains, TCP-connects to common service ports, and queries third-party vulnerability databases. **Only run it against sites/infrastructure you own or have explicit written permission to test.** Every probe is a single unauthenticated GET/OPTIONS/DNS/TCP-connect to a publicly documented path, record, or port — no auth bypass, brute force, fuzzing, or payload injection is performed, and destructive HTTP verbs (PUT/DELETE) are only *introspected* via OPTIONS, never sent. The one exception is the **authenticated admin audit** (see below), which requires you to supply valid login credentials yourself — it only ever reads screens the logged-in account already has access to. Unauthorized scanning of third-party infrastructure may still violate computer-fraud laws or terms of service even when every individual request is "harmless" on its own.
+**Only run this tool against sites and infrastructure you own, or that you have the owner's explicit written permission to test.** Some of what it does is the recon phase of a penetration test, and in many places requests like these count as security testing that needs permission, even when every request is harmless on its own. Unauthorized scanning can break computer-misuse laws (such as the US CFAA or the UK Computer Misuse Act) and hosting providers' terms. Permission from a site's owner doesn't cover the hosting company's own servers: many hosts forbid port scans of their network, so add `--skip-port-scan` unless the host allows it.
+
+The checks come in two kinds:
+
+- **Passive (always on):** what any visitor gets. The pages, response headers and cookies, TLS, DNS and WHOIS, security.txt, the scripts and libraries the pages load, and public vulnerability databases (OSV.dev, WPScan).
+- **Active (pentest-style, need confirmed permission):** exposed config/backup/admin/login/API paths and GraphQL introspection, subdomain liveness, a TCP port scan, open-redirect, HTTP-method, WordPress user-enumeration and error-disclosure probes, and the authenticated WordPress/Drupal admin audit.
+
+The active checks only run after you confirm: pass `--authorized` (for scripts and CI), or type "yes" when an interactive run asks. Without that, a run is passive only and says what it skipped. The confirmation is written into the run's `summary.json` and `full-report.json` (`authorization`: the exact statement and its version, the time, your OS user name and how it was given), so each report shows what was agreed.
+
+Even the active checks stay gentle: every probe is a single GET, OPTIONS, DNS lookup or TCP connect to a publicly documented path, record or port. No auth bypass, brute force, fuzzing or payload injection; destructive HTTP verbs (PUT/DELETE) are only *introspected* via OPTIONS, never sent. The authenticated admin audit only uses credentials you supply and only reads screens that account can already see.
+
+**No warranty, no liability.** This software is provided "as is" under the MIT License (see `LICENSE`): the authors aren't liable for any claim or damage arising from its use. You are solely responsible for having permission for every site you test and for how you use the results.
 
 ## What it checks
 
@@ -123,6 +140,7 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com
 | Flag | Description |
 | --- | --- |
 | `--site <url>` | **(required)** Target website URL |
+| `--authorized` | Confirm you own the site or have the owner's written permission, so the active (pentest-style) checks run; recorded in the report. Without it, an interactive run asks, and a non-interactive one (CI, `--json`, batch) is passive only. Alias `--i-have-permission` |
 | `--max-pages <n>` | Max pages to scan. Omit it and there's no limit — sitemap discovery pulls every URL it finds, and `--crawl` follows links until it exhausts the site; pass a number to cap either one on large sites |
 | `--crawl` | Discover pages by following internal links instead of using the sitemap |
 | `--max-per-url-pattern <n>` | Crawl-trap guard (default 3): caps how many pages matching the same URL "shape" get crawled — path segments that look like IDs/hashes/years (`/participants/mypage/1174017/2026`) are collapsed to a placeholder (`/participants/mypage/:id/:id`) for this comparison, so a site with thousands of per-record pages (fundraiser pages, product pages, forum threads) doesn't turn an uncapped `--crawl` into tens of thousands of near-duplicate requests |
@@ -307,10 +325,10 @@ node bin/universal-security-audit.mjs audit --site https://www.example.com \
 
 ### Quick first-pass on a live WordPress site
 
-Default posture — fast, unauthenticated, safe to run against a client's live production site without asking anyone first (still get permission):
+Fast and unauthenticated, but the active checks still need the client's written permission first (`--authorized` records that you have it):
 
 ```bash
-node bin/universal-security-audit.mjs audit --site https://www.example.com --intensity light
+node bin/universal-security-audit.mjs audit --site https://www.example.com --intensity light --authorized
 ```
 
 ### Full authenticated WordPress security review
@@ -320,7 +338,7 @@ Agency-style deep audit: create an Application Password in the client's wp-admin
 ```bash
 node bin/universal-security-audit.mjs audit --site https://www.example.com \
   --wp-app-user admin --wp-app-password "xxxx xxxx xxxx xxxx xxxx xxxx" \
-  --wpscan-key YOUR_WPSCAN_KEY --crawl --max-pages 50
+  --wpscan-key YOUR_WPSCAN_KEY --crawl --max-pages 50 --authorized
 node bin/universal-security-audit.mjs tickets --run-dir ./reports/<run-id>
 ```
 
@@ -332,7 +350,7 @@ Same shape, form-login only (no Application Passwords in Drupal core):
 
 ```bash
 node bin/universal-security-audit.mjs audit --site https://www.example.com \
-  --login-url https://www.example.com/user/login --username admin --password your-password
+  --login-url https://www.example.com/user/login --username admin --password your-password --authorized
 ```
 
 ### E-commerce / donation site
@@ -356,7 +374,7 @@ node bin/universal-security-audit.mjs audit --site https://staging.example.com \
 
 ```bash
 node bin/universal-security-audit.mjs audit --site https://www.example.com \
-  --intensity light --skip-port-scan --skip-subdomain-enum \
+  --intensity light --skip-port-scan --skip-subdomain-enum --authorized \
   --baseline ./security-baseline.json --fail-on high --json > report.json
 node bin/universal-security-audit.mjs sarif --run-dir "$(ls -td reports/*/ | head -1)" --out results.sarif
 ```
@@ -367,7 +385,7 @@ Then upload `results.sarif` with `github/codeql-action/upload-sarif` so findings
 
 ```bash
 node bin/universal-security-audit.mjs batch-audit --sites-file ./client-sites.txt \
-  --intensity light --skip-cve --concurrency 2
+  --intensity light --skip-cve --concurrency 2 --authorized
 ```
 
 Pair with a cron/scheduled job and diff each site's `summary.json` week over week (or use `compare` against the prior run per site) to catch regressions before a client notices.
@@ -397,7 +415,7 @@ Maximum coverage, routed through Burp Suite so a human can inspect/replay anythi
 node bin/universal-security-audit.mjs audit --site https://www.example.com \
   --intensity aggressive --crawl --max-pages 100 \
   --wordlist ./my-wordlist.txt --proxy http://127.0.0.1:8080 \
-  --wp-app-user admin --wp-app-password "xxxx xxxx xxxx xxxx xxxx xxxx" --wpscan-key YOUR_KEY
+  --wp-app-user admin --wp-app-password "xxxx xxxx xxxx xxxx xxxx xxxx" --wpscan-key YOUR_KEY --authorized
 ```
 
 ## Risk grading

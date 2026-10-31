@@ -36,7 +36,7 @@ Commands:
 Examples:
   universal-security-audit audit --site https://www.example.com
   universal-security-audit audit --site https://www.example.com --crawl --max-pages 25
-  universal-security-audit audit --site https://www.example.com --intensity aggressive
+  universal-security-audit audit --site https://www.example.com --authorized --intensity aggressive
   universal-security-audit audit --site https://www.example.com --wpscan-key YOUR_KEY
   universal-security-audit audit --site https://www.example.com --skip-exposed-paths --skip-recon
   universal-security-audit audit --site https://www.example.com --login-url https://www.example.com/wp-login.php --username U --password P
@@ -51,7 +51,11 @@ Examples:
   universal-security-audit baseline --run-dir ./reports/<run-id> --out ./security-baseline.json
   universal-security-audit batch-audit --sites-file ./sites.txt --intensity light
 
+Pentest-style (active) checks need the site owner's written permission: pass --authorized,
+or answer "yes" when asked. Without it a run is passive only.
+
 Key flags (see README for the full list):
+  --authorized                          Confirm written permission; runs the active checks
   --intensity light|normal|aggressive   Concurrency/delay/probe-size dial
   --max-pages <n>                       Cap pages scanned (default: no limit)
   --max-depth <n>                        Link-hops from homepage to follow during --crawl

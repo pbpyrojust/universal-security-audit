@@ -41,6 +41,7 @@ import {
 import { enumerateTlsProtocols, getWeakProtocolFindings } from './lib/tls-enum.mjs';
 import { introspectGraphQL } from './lib/graphql-introspect.mjs';
 import { loadBaseline, applyBaseline } from './lib/baseline.mjs';
+import { resolveAuthorization, ACTIVE_CHECKS } from './lib/authorization.mjs';
 
 // ── CLI / generic helpers ───────────────────────────────────────────────
 function parseArgs(argv) {
@@ -279,13 +280,16 @@ const maxPerTemplate = args['max-per-url-pattern'] ? Number(args['max-per-url-pa
 const maxDepth = args['max-depth'] ? Number(args['max-depth']) : Infinity;
 const slowMode = Boolean(args['slow']);
 const respectRobots = Boolean(args['respect-robots']);
-const skipExposedPaths = Boolean(args['skip-exposed-paths']);
+// Active checks only run with the owner's written permission confirmed (lib/authorization.mjs).
+const authorization = await resolveAuthorization(args, site);
+const activeAllowed = Boolean(authorization);
+const skipExposedPaths = Boolean(args['skip-exposed-paths']) || !activeAllowed;
 const skipCve = Boolean(args['skip-cve']);
-const skipRecon = Boolean(args['skip-recon']);
-const skipPortScan = Boolean(args['skip-port-scan']);
-const skipSubdomainEnum = Boolean(args['skip-subdomain-enum']);
+const skipRecon = Boolean(args['skip-recon']) || !activeAllowed;
+const skipPortScan = Boolean(args['skip-port-scan']) || !activeAllowed;
+const skipSubdomainEnum = Boolean(args['skip-subdomain-enum']) || !activeAllowed;
 const skipWhois = Boolean(args['skip-whois']);
-const skipAdminAudit = Boolean(args['skip-admin-audit']);
+const skipAdminAudit = Boolean(args['skip-admin-audit']) || !activeAllowed;
 const wpscanApiKey = args['wpscan-key'] || process.env.WPSCAN_API_KEY || '';
 const branding = loadBranding(fs, path, args['brand-config']);
 const intensity = resolveIntensity(args['intensity']);
@@ -313,7 +317,11 @@ out(`  ${c.brightMagenta}📁${c.reset} ${c.bold}Output:${c.reset}     ${c.dim}$
 out(`  ${c.brightMagenta}🔑${c.reset} ${c.bold}WPScan key:${c.reset} ${wpscanApiKey ? `${c.brightGreen}configured${c.reset}` : `${c.dim}not set (WordPress CVE lookups will be skipped)${c.reset}`}`);
 out(`  ${c.brightMagenta}⚡${c.reset} ${c.bold}Intensity:${c.reset}  ${args['intensity'] || 'normal'}${proxyUrl ? `  ${c.dim}·${c.reset} proxying via ${proxyUrl}` : ''}`);
 if (authSettings.httpCredentials || authSettings.formAuth) console.log(`  ${c.brightMagenta}🔐${c.reset} ${c.bold}Auth:${c.reset}       ${authSettings.formAuth ? 'form login configured' : 'HTTP basic credentials configured'}`);
-statusMsg('⚠', c.brightYellow, 'Authorized-use only — this tool actively probes admin/config paths and login forms. Only run it against sites you own or have written permission to test.');
+if (activeAllowed) {
+  statusMsg('⚠', c.brightYellow, `Active checks ON (permission confirmed ${authorization.how === 'flag' ? 'with --authorized' : 'at the prompt'}; recorded in the report). Only run them on sites you own or have the owner's written permission to test.`);
+} else {
+  statusMsg('🔒', c.brightYellow, `Passive checks only. These need the owner's written permission and were skipped: ${ACTIVE_CHECKS.join('; ')}. Confirm with --authorized to run them.`);
+}
 
 let robotsCfg = { isAllowedUrl: null };
 if (respectRobots) robotsCfg = await buildRobotsMatcher(site);
@@ -1101,6 +1109,8 @@ const summaryData = {
   wpAdminAudit,
   drupalAdminAudit,
   suppressedFindingsCount: suppressedCount,
+  activeChecks: activeAllowed,
+  authorization,
 };
 fs.writeFileSync(path.join(outDir, 'summary.json'), JSON.stringify(summaryData, null, 2), 'utf8');
 

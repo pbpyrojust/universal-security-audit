@@ -1,6 +1,6 @@
 {
   "name": "@pbpyrojust/universal-security-audit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "packageManager": "pnpm@10.8.0",
   "description": "Technical security & attack-surface audit CLI: security header grading, CMS/hosting fingerprinting, exposed-path & admin/API discovery, third-party script + CVE lookups (OSV.dev/WPScan), PII & payment-processor detection, and a risk-graded HTML/PDF report.",
