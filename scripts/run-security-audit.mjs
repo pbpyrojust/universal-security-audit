@@ -834,6 +834,15 @@ if (!skipCve) {
         wpscanRateLimited = true;
         statusMsg('⚠', c.brightYellow, 'WPScan free-tier daily limit (25 requests/day) reached — remaining WordPress CVE lookups skipped for this run. Limit resets daily; see https://wpscan.com/api for paid tiers.');
       };
+      // A refused key (WPScan answers 403 for a missing or invalid token) fails every lookup the
+      // same way, so stop after the first one instead of repeating the warning per plugin/theme.
+      const stopOnRefusal = (res, what) => {
+        if (!res.error || res.rateLimited) return false;
+        if (!/unauthorized/.test(res.error)) { statusMsg('⚠', c.brightYellow, `WPScan ${what} lookup: ${res.error}`); return false; }
+        wpscanRateLimited = true;
+        statusMsg('⚠', c.brightYellow, 'WPScan refused the API key (missing, mistyped or revoked) — WordPress CVE lookups skipped for this run. Check WPSCAN_API_KEY / --wpscan-key.');
+        return true;
+      };
 
       if (wpCore.version) {
         const coreRes = await wpscanCoreLookup(wpCore.version, wpscanApiKey);
@@ -842,7 +851,7 @@ if (!skipCve) {
           for (const v of coreRes.vulns) addFinding({ category: 'cve', severity: 'critical', title: `WordPress core ${wpCore.version}: ${v.title}`, detail: v.fixedIn ? `Fixed in ${v.fixedIn}.` : 'No fix version listed.', url: Array.isArray(v.references) ? v.references[0] : String(v.references || '') });
         }
         if (coreRes.rateLimited) warnRateLimit();
-        else if (coreRes.error) statusMsg('⚠', c.brightYellow, `WPScan core lookup: ${coreRes.error}`);
+        else stopOnRefusal(coreRes, 'core');
       }
       for (const p of wpPlugins) {
         if (wpscanRateLimited) break;
@@ -855,7 +864,7 @@ if (!skipCve) {
           }
         }
         if (res.rateLimited) { warnRateLimit(); break; }
-        if (res.error) statusMsg('⚠', c.brightYellow, `WPScan plugin lookup (${p.slug}): ${res.error}`);
+        if (stopOnRefusal(res, `plugin (${p.slug})`)) break;
         await sleep(250); // stay well under WPScan free-tier rate limit
       }
       for (const t of wpThemes) {
@@ -869,7 +878,7 @@ if (!skipCve) {
           }
         }
         if (res.rateLimited) { warnRateLimit(); break; }
-        if (res.error) statusMsg('⚠', c.brightYellow, `WPScan theme lookup (${t.slug}): ${res.error}`);
+        if (stopOnRefusal(res, `theme (${t.slug})`)) break;
         await sleep(250);
       }
     }
